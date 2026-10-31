@@ -1,15 +1,15 @@
 {
-  "versionName": "2.0.28",
-  "tag": "v2.0.28",
-  "versionCode": 20028,
-  "apk": "AIIvideo-v2.0.28-release.apk",
+  "versionName": "2.0.29",
+  "tag": "v2.0.29",
+  "versionCode": 20029,
+  "apk": "AIIvideo-v2.0.29-release.apk",
   "urls": [
-    "https://gh-proxy.com/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.28/AIIvideo-v2.0.28-release.apk",
-    "https://ghfile.geekertao.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.28/AIIvideo-v2.0.28-release.apk",
-    "https://gh.dpik.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.28/AIIvideo-v2.0.28-release.apk",
-    "https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.28/AIIvideo-v2.0.28-release.apk"
+    "https://gh-proxy.com/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.29/AIIvideo-v2.0.29-release.apk",
+    "https://ghfile.geekertao.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.29/AIIvideo-v2.0.29-release.apk",
+    "https://gh.dpik.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.29/AIIvideo-v2.0.29-release.apk",
+    "https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.29/AIIvideo-v2.0.29-release.apk"
   ],
-  "sha256": "aed17ddc652de78e9ab53a299fe44bea31bc00ee615527571127e81632c8bbd8",
-  "size": 40997138,
-  "notes": "2.0.28：三个都跟「代理能不能用」有关，也都是真机上抓出来的。\n\n一、测速报的「延迟」根本不是节点的延迟\n\n`PROBE_URL` 是 `https://www.gstatic.com/generate_204`，而这个域在 geosite 的\n**cn** 分类里（和 `gstatic.cn` 同一组）。分流规则里有一条 `geosite:cn → direct`，\n于是探针请求被送去**手机直连**，从来没出过节点。\n\n真机证据是 Xray 自己的访问日志：\n\n```\ntcp:127.0.0.1:40456 accepted tcp:www.gstatic.com:443 [direct]\n```\n\n同一时刻同一个核心里，`//missav.live:443` 和 `//content-autofill.googleapis.com:443`\n都是 `[proxy]` —— 只有 gstatic 被截走。国内直连 gstatic 是通的（联通缓存，204/0.21s），\n再取两次往返的较小值，落到界面上就是那个数：8 个不同国家的节点连报\n`84 / 85 / 85 / 88 / 84`，因为它们测的是同一条直连。\n\n比数字难看更糟的是**它永远给绿灯**。同一分钟测速 6 个全「通」，切过去之后每一条出站\n都是 `failed to dial to (wss://…): 404`。\n\n改法：新增一套只给探针用的配置，routing 里只有一条「所有流量 → 这个出站」，不加载\ngeosite / 直连白名单 / 源声明；探针地址换成 `https://www.google.com/generate_204`\n（不在 geosite:cn，国内直连必不通 —— 哪天规则又漏回来，表现是「测不通」而不是「假的通」）。\n\n修完同样的操作，7 个免费节点从「全是 85ms」变成\n`192 美西 / 205 罗马尼亚 / 209 荷兰 / 254 / 308 / 365 / 超时`，地理排序也对上了。\n\n二、走 WebSocket 的节点全部 404（path 丢了）\n\n订阅里是这么写的：\n\n```yaml\nws-opts: {path: /ws, headers: {Host: zhaoruizhe.site}}\n```\n\n解析器只认「整行 key: value」，这一行进去只有一个键 `ws-opts`，值是整段花括号文本。\n`path` 取不到，V2Ray 按默认 `/` 去拨 `wss://host/`，而服务端只有 `location /ws` ——\n于是每条 ws 节点都 404。\n\n现在按花括号深度切逗号递归摊平，行内写法和多行缩进写法都能取到。\n\n三、接上了 hysteria2（订阅里那条「不支持的协议」）\n\n订阅里一直有一条 `type: hysteria2`，界面上显示成「1 个不支持」。那是**主线路**：\nUDP 直连，不像 TCP 那样被封。核心其实一直支持（内置的是 v2fly v2ray-core v5，\n自带 `proxy/hysteria2` 出站），是我们自己的解析没接 —— 三处协议白名单都没写 `hy2://`。\n\n接的过程中踩了两个键名：`settings.servers` 是复数、传输层是 `hy2Settings` 不是\n`hysteria2Settings`（写错不报错，只表现为认证失败 404）。都用单元测试锁住了。\n\n**这条需要你在服务端配合**：混淆（obfs: salamander）内置核心不支持，所以另开了一个\n不带混淆的入站（24444），订阅里加了 `hy2-plain`。带混淆的 24443 原样保留，mihomo /\nsing-box 照旧用。\n\n真机实测：\n\n```\n测速 → 测了 9 个，通了 2 个\n        164ms  美国  hy2-plain\n        204ms  加拿大 cf-ws-ip2\n```\n\n四、顺带\n\n- mrds66 的封面图床换到 `pic.gyezbp.cn`、51cg 换到 `pic.drleao.cn`，白名单已经补上。\n  **装过这两个源的，要重新添加一次那个源才生效**（配置是加源那一刻存盘的）。\n- 带混淆的 hysteria2 节点现在会明确显示成「hysteria2(salamander)」而不是静默丢掉。\n\n这一版**都是 Java 侧的改动，热更换不了**，要拿到得装这个包。\n\n---\n\nsha256: `aed17ddc652de78e9ab53a299fe44bea31bc00ee615527571127e81632c8bbd8`\n大小: 40,997,138 字节（39.1 MB）\n单测 311 条全过（新增 `XrayProbeConfigTest` 5 条、`XrayHysteria2Test` 6 条、\n`SubscriptionClashTest` 加 6 条），42 条 JS 钩子断言全过，APK 断言\n（27 个 JS 全部 ES2017 可解析、dex 1 / so 4 / assets 77）通过。"
+  "sha256": "573031f74e79d81fbcd3657c2a3dcf69de44e9370f86c6f085caaa64e292c17c",
+  "size": 41023018,
+  "notes": "2.0.29：对全部应用代码做了一轮九模块并行深审（桥接 / 播放器 / 网络 / 代理 / Spider 运行时 / 存储 / 更新 / 前端），修掉五十多处问题，外加三项安全加固。这版更新比较大，挑能感知的说：\n\n**一、崩溃与数据**\n\n- 修复「下载更新途中页面崩过一次，下一条更新进度回调把整个应用带崩」\n- 修复云同步把删掉的收藏 / 观看历史「复活」：匿名期删过的，登录后会保持删除\n- 快速双击「播放」不再叠出第二个播放器实例（原来旧的整套解码器留在内存里，两边退出时进度互相覆盖）\n\n**二、播放与源**\n\n- 大体积源（约 0.6～2MB）原来「装得上、永远调不通」，现在真正能跑\n- 封面批量加载不再互相拆台（并发时把正在加载的实例销毁，整页灰 12 秒）\n- 抓取页面不再偶发把上一步的旧页面当结果\n- 恢复出厂现在连源缓存、已装源脚本一起清掉\n\n**三、更新体验**\n\n- 「下载更新」不再 45 秒假超时（原来包还在下，界面已经报失败来回跳）\n- 冷启动的更新检查不再偷偷打约 1MB 探速流量\n- 镜像吐错误页不会再把本地待更新清单抹掉\n\n**四、代理与订阅**\n\n- 粘错一条链接不再覆盖存好的节点链接\n- `socks://` 订阅正确识别；缺字段的节点会计数报出来，不再静默消失\n- 测速不再被坏域名的 DNS 卡住几分钟（代价：域名节点暂不显示国旗）\n- `https://` 开头的外部代理串现在明确拒绝（原来接受但按明文用，必然连不上）\n\n**五、安全加固（三项）**\n\n- 页面加上 CSP：前端联网只许走应用桥，注入脚本无法直连外网\n- 本地播放中继加 HMAC 签名：同设备其它应用无法再借用播放通道、带你的出口发请求\n- 源封面的私网校验改为「解析一次、钉死 IP 直连」，封死 DNS rebinding 绕过\n\n**六、顺带**\n\n- 设置页点版本图标不再报错；市场装源加互斥；封面加载失败不再一刀切冻五分钟（网络类 30 秒即可重试）；观看进度存储加上限\n\n说明：前端热更通道已停用，本版前端改动全部随 APK 发。本版未改任何源配置，已装的源无需重新添加。\n\n---\n\nsha256: `573031f74e79d81fbcd3657c2a3dcf69de44e9370f86c6f085caaa64e292c17c`\n大小: 41,023,018 字节（39.1 MB）\n单测 364 条全过（较上版 +53），42 条 JS 钩子断言全过，APK 断言（27 个 JS 全部 ES2017 可解析、dex 1 / so 4 / assets 77）通过。真机（小米 23113RKC6C）冷启动 / 首页 / 起播验证通过。"
 }
