@@ -101,7 +101,19 @@ final class SiteProfile {
             throw new IllegalArgumentException("缺少封面域名");
         }
         for (int i = 0; i < jSONArray.length(); i++) {
-            if (!jSONArray.getString(i).matches("[a-zA-Z0-9.-]+")) {
+            String str = jSONArray.getString(i);
+            // 两种写法：精确主机（pic.drleao.cn），或**单层通配**（pic.*.cn）。
+            // 通配是 2026-10-31 加的：同一族图床在 51cg / mrds66 / 黄果之间轮换，
+            // 二级域六个字符随机换（drleao / gyezbp / sugfew / nihmcl …），
+            // 每换一次就要改一遍配置、还要用户回去刷新源 —— 而用户看到的现象只是
+            // 「这个源没有封面」。`*` 不许在首尾、不许连着写，是为了让模式本身
+            // 就把作用域钉死在「一个标签」，不会退化成 *.cn 这种全放行。
+            // 通配只支持一个星号、且不能出现在首尾（`pic.*.*.cn`、`*.cn`、`pic.*`
+            // 一律按配置错误拒掉）—— 写错的通配宁可当场报错，也别留成一条
+            // 「看着像放行了、其实永远匹配不上」的死条目。
+            if (!str.matches("[a-zA-Z0-9.*-]+")
+                    || str.indexOf('*') != str.lastIndexOf('*')
+                    || str.startsWith("*") || str.endsWith("*")) {
                 throw new IllegalArgumentException("无效封面域名");
             }
         }
@@ -188,7 +200,7 @@ final class SiteProfile {
         }
         JSONArray jSONArray = object("cover").getJSONArray("allowedHosts");
         for (int i = 0; i < jSONArray.length(); i++) {
-            if (host.equalsIgnoreCase(jSONArray.getString(i))) {
+            if (hostMatches(jSONArray.getString(i), host)) {
                 return uri.toString();
             }
         }
@@ -196,6 +208,42 @@ final class SiteProfile {
         // 拿不到 host 就无法判断该往 allowedHosts 里补什么，等于白报。
         throw new IllegalArgumentException("无效封面域名：" + host
                 + "（白名单：" + jSONArray.toString() + "）");
+    }
+
+    /**
+     * 白名单条目 VS 实际主机。包可见，单测直接盯。
+     *
+     * <p>精确条目按忽略大小写比；带 {@code *} 的按 {@link #hostWildcard} 比。
+     */
+    static boolean hostMatches(String pattern, String host) {
+        if (pattern == null || host == null) return false;
+        if (pattern.indexOf('*') < 0) return host.equalsIgnoreCase(pattern);
+        return hostWildcard(pattern, host);
+    }
+
+    /**
+     * 单层通配：{@code pic.*.cn} 匹配 {@code pic.sugfew.cn}，<b>不</b>匹配
+     * {@code pic.a.b.cn}，也不匹配 {@code evilpic.sugfew.cn}。
+     *
+     * <p>故意不用正则：这是每张封面都要走一次的判断（一屏二十条、封面刷新
+     * 三十秒一轮），切两刀比编一个 Pattern 便宜；而且正则里那几个没转义的点
+     * 一旦写错就是「全放行」，手工比反而没有这个坑。
+     */
+    static boolean hostWildcard(String pattern, String host) {
+        int star = pattern.indexOf('*');
+        if (star < 0) return host.equalsIgnoreCase(pattern);
+        // 星号在首尾等于「整段放行」，构造校验本来就会把这种模式拒掉；这里再挡一次，
+        // 是因为这个函数是包可见的、单测与将来别的调用方都能直接进 —— 两处都拦，
+        // 就不会出现「校验改松了、匹配还放宽着」这种只有一处记得改的裂缝。
+        if (star == 0 || star == pattern.length() - 1) return false;
+        String prefix = pattern.substring(0, star).toLowerCase(java.util.Locale.ROOT);
+        String suffix = pattern.substring(star + 1).toLowerCase(java.util.Locale.ROOT);
+        // 第二个 * 不做支持：suffix 里带着它就是永远匹配不上，等于这条白名单失效。
+        if (suffix.indexOf('*') >= 0) return false;
+        String h = host.toLowerCase(java.util.Locale.ROOT);
+        if (!h.startsWith(prefix) || !h.endsWith(suffix)) return false;
+        String middle = h.substring(prefix.length(), h.length() - suffix.length());
+        return middle.length() > 0 && middle.indexOf('.') < 0;
     }
 
     boolean patchHeader(byte[] bArr) throws Exception {

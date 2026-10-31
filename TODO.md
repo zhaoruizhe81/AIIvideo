@@ -10,6 +10,83 @@
 > 历史。看的时候注意每段的日期。哪份文档是现行口径、哪份只剩历史价值，
 > 看 [`docs/README.md`](docs/README.md)。
 
+## 2026-10-31 晚：黄果没有封面，三件事叠在一起
+
+用户报「黄果短剧没有封面」。真机（7f8f5254，2.0.28）上确实是整页占位首字
+（神/高/女/少/失/时），连 banner 都是空渐变。重启 App 立刻全好 —— 一句话
+说明**源、密钥、接口都没坏**，坏的是「一次失败之后不肯再试」。
+
+拆开是三层：
+
+### 一、封面主机在轮换，白名单没跟上（一部分设备永远没封面）
+
+同一族加密图床在 51cg / mrds66 / 黄果之间共用，二级域**六个随机字符**换来换去。
+遥测里近 14 天被拒的主机名，按源排一遍就看清了：
+
+| 源 | 被拒主机 | 次数 / 设备 |
+|---|---|---|
+| mrds66 | `pic.gyezbp.cn` / `pic.nihmcl.cn` | 139/61、61/27 |
+| huangguo | `pic.sugfew.cn` / `pic.gyezbp.cn` | 16/4、10/5 |
+| porn91 | `pic.gyezbp.cn` / `pic.drleao.cn` | 7/5、7/4 |
+| missav / yhdm / 51cg | `pic.drleao.cn` 等 | 各 4~13 |
+
+而白名单是**精确匹配**，`SiteProfile.coverUrl()` 对表外域名直接抛
+`无效封面域名：xxx（白名单：[…]）`，不走降级。所以每轮换一次，就得挨个源补一次；
+没补上的那批设备，封面是**永久**灰的 —— 它们不会自己好。
+
+当场把三个 aes-cbc 源的线上配置补齐（`/srv/cfg/spiders/*.json`，各留
+`*.bak-cover-<时间戳>`），并给 `allowedHosts` 加了**单层通配**：
+`pic.*.cn` 放行 `pic.sugfew.cn`，不放行 `pic.a.b.cn`（跨层）、
+`evilpic.sugfew.cn`（前缀不对）、`*.cn` / `pic.*` / `pic.*.*.cn`（模式本身非法，
+加载源时就拒）。以后轮换不用再跟。
+
+线上配置暂时**只写精确主机**：通配语法要 2.0.29 才认，老版本读到 `pic.*.cn`
+会把整份源判成非法 —— 得等 2.0.29 铺开再换。
+
+### 二、一次网络抖动 = 整页封面黑五分钟（这台设备的现象）
+
+`rememberFailure()` 里 URL 级和主机级用的是同一个 5 分钟。主机级那一层的
+本意是「同一个配置错误别报 34 次」，可它对**网络类**失败也照冻：
+
+```
+19:40:27 E/AIIvideo: cover failed
+19:40:27 E/AIIvideo: CoverFailure: 封面主机刚刚失败过（pic.drleao.cn），本轮不再重复上报
+```
+
+三秒一条，一条真请求都不发。那会儿手机直连 `pic.drleao.cn` 已经是
+`code=200 size=174816 tls=0.123`（adb shell curl 验的）—— 网络早好了，界面还黑着。
+
+改法：主机级冻结期**按失败类型分档**。配置类（白名单 / 格式 / 密钥）重试一万次
+结果一样，继续冻满 5 分钟；网络类只冻 `FAIL_HOST_NET_MS = 45 秒`。另外补了
+`forgetFailure()` —— 以前成功之后主机记录还挂着，白挂到 TTL 到期。
+
+### 三、缓存键每 90 分钟整体作废，等于每 90 分钟重下一次图床
+
+封面 URL 上挂着 `?auth_key=<过期戳>-0-0-<md5>`，实测约 90 分钟换一批。缓存键
+把整个 query 算进去了，所以每一轮签名都让全部封面 miss 一次 —— 每多下一遍，
+就多一次「运气不好撞上抖动 → 整页黑掉」的机会。
+
+改成剔掉签名参数（`auth_key` / `sign` / `signature` / `token` / `expires` /
+`ossaccesskeyid` / `x-oss-credential`），其余业务参数照留。签名只决定「给不给你看」，
+不决定「是哪张图」。
+
+顺带修了同一段里的两处：
+
+- `Files.readAllBytes()` 的 ENOENT。`isFile()` 和读之间文件被 `trimCoverCache`
+  删掉了，报成 FileNotFoundException 进上报 —— 线上那 70 条（同一个 uid 150 的
+  设备）就是这么来的，而它其实是「缓存没了，重抓就行」。
+- banner 的相对路径拼 `PIC` 常量（`https://pic.drleao.cn`）这一层没动：接口
+  目前所有相对路径都由它给，四个活主机里它也在（`drleao` / `gyezbp` / `sugfew` /
+  `nihmcl`；`fisawck` / `tkzdds` / `wirqed` 已死）。
+
+### 验证
+
+- 单测 322 条全过（311 → 322：`CoverFailureCacheTest` +4、`CoverHostWhitelistTest` +7）
+- 真机 7f8f5254（2.0.29）：黄果首页 banner + 列表封面全部出图
+- 线上配置：`pic.sugfew.cn` / `pic.nihmcl.cn` / `pic.jtzatly.cn` / `pic.gyezbp.cn`
+  都 `code=200`（从一个真实封面路径试的）
+
+
 ## 2026-10-31 下午：hy2 接上了（订阅里的「1 个不支持」）
 
 订阅里一直有一条 `type: hysteria2`，UI 上显示成「1 个不支持（hysteria2）」。那是我们的

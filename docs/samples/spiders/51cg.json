@@ -13,7 +13,11 @@
     "iv": "97b60394abc2fbe1",
     "keyEncoding": "text",
     "allowedHosts": [
-      "pic.gyezbp.cn"
+      "pic.gyezbp.cn",
+      "pic.drleao.cn",
+      "pic.sugfew.cn",
+      "pic.nihmcl.cn",
+      "pic.jtzatly.cn"
     ],
     "hostRewrites": {},
     "_why": "2026-10-23 起站点把图床上的图整份 AES-128-CBC 加密了：文件是 16 字节对齐的密文，不是 JPEG。页面里 zzz.js 的 decryptImage() 用同一套 key/iv 在浏览器里解（和 mrds66 那份配置同一个密钥）。App 侧直接吃同一对参数，浏览器那句 ab2b64 + decryptImage 就不需要了 —— 抓到的原始字节喂给 Cipher 即可。验证：openssl enc -d -aes-128-cbc 解出来 3eaa… 开头那份 → ffd8ff（JPEG）。"

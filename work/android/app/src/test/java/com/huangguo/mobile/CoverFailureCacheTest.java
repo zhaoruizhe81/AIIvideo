@@ -67,4 +67,48 @@ public class CoverFailureCacheTest {
 
         assertNull("过期了就该放过", SiteRepository.hostFailure("https://stale.example.com/a.jpg"));
     }
+
+    /**
+     * 网络类失败的冻结期必须远短于配置类。
+     *
+     * 真机证据（2026-10-31）：换完版本第一次打开黄果，一张封面赶上网络抖动，
+     * 主机级缓存把整页二十张全挡了五分钟 —— 用户看到的是「这个源没有封面」，
+     * 而每三秒一次的重试全打在缓存上，一次真请求都没发出去。
+     */
+    @Test
+    public void 网络类失败不能把主机冻满五分钟() {
+        assertTrue("网络抖一下的代价必须小", SiteRepository.FAIL_HOST_NET_MS <= 60 * 1000L);
+    }
+
+    /** 拿到图之后，「这个主机刚失败过」这笔旧账必须立刻作废。 */
+    @Test
+    public void 成功之后主机记录立刻作废() {
+        SiteRepository.resetCoverFailureCache();
+        SiteRepository.rememberFailure("https://cdn.example.com/a.jpg",
+                "Connection reset", SiteRepository.FAIL_HOST_NET_MS);
+        assertTrue("记上之后同主机其它封面该被挡",
+                SiteRepository.hostFailure("https://cdn.example.com/b.jpg") != null);
+
+        SiteRepository.forgetFailure("https://cdn.example.com/a.jpg");
+
+        assertNull("抓回来了就不该再拿旧账挡后面那些",
+                SiteRepository.hostFailure("https://cdn.example.com/b.jpg"));
+    }
+
+    /**
+     * 缓存键剔掉签名参数、留着业务参数。
+     *
+     * 黄果封面挂着 {@code ?auth_key=<过期戳>-0-0-<md5>}，约九十分钟换一批。
+     * 把它算进键里等于每九十分钟把整个图床重下一遍，而每多下一遍就多一次
+     * 「运气不好碰上一次抖动 → 整页封面黑掉」的机会。
+     */
+    @Test
+    public void 缓存键剔签名留业务参数() {
+        assertEquals("", SiteRepository.cacheKeyQuery("auth_key=1793454192-0-0-41a0ba24"));
+        assertEquals("id=7&w=480", SiteRepository.cacheKeyQuery("id=7&auth_key=abc&w=480"));
+        // 前缀像但不是签名参数，不能误伤（精确比名字，不是 startsWith）。
+        assertEquals("auth_level=2", SiteRepository.cacheKeyQuery("auth_level=2"));
+        assertEquals("", SiteRepository.cacheKeyQuery(null));
+        assertEquals("", SiteRepository.cacheKeyQuery(""));
+    }
 }

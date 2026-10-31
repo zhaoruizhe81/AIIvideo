@@ -160,7 +160,10 @@
     "keyEncoding": "text",
     "allowedHosts": [
       "pic.sugfew.cn",
-      "pic.jtzatly.cn"
+      "pic.jtzatly.cn",
+      "pic.nihmcl.cn",
+      "pic.gyezbp.cn",
+      "pic.drleao.cn"
     ],
     "hostRewrites": {}
   }

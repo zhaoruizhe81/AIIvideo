@@ -96,6 +96,15 @@ final class SiteRepository {
     // 所以再存一份按**主机**的：同一个主机上的失败，后面那些不再逐个上报。
     // 消息里带上第一次的原文，方便知道是哪一类问题（白名单/网络/解密）。
     private static final long FAIL_CACHE_MS = 5 * 60 * 1000L;
+    /**
+     * 网络类失败的主机冻结期。**必须远短于 FAIL_CACHE_MS**。
+     *
+     * 2026-10-31 真机：换完版本第一次打开黄果，一张封面赶上网抖失败，主机级缓存
+     * 把整页 20 张全挡了五分钟，用户看到的是「这个源没有封面」。而每 3 秒一次的
+     * 重试全打在缓存上，一次真请求都不发 —— 网络早好了，界面还黑着。
+     * 配置类（白名单/格式/密钥）重试一万次结果一样，那才配用满 5 分钟。
+     */
+    static final long FAIL_HOST_NET_MS = 45 * 1000L;
     private static final int FAIL_CACHE_MAX = 300;
     private static final java.util.Map<String, CoverFailure> FAILED =
             new java.util.concurrent.ConcurrentHashMap<String, CoverFailure>();
@@ -113,7 +122,17 @@ final class SiteRepository {
         }
     }
 
+    /** 配置类失败：重试无意义，URL 和主机都冻满 5 分钟。 */
     static void rememberFailure(String url, String message) {
+        rememberFailure(url, message, FAIL_CACHE_MS);
+    }
+
+    /**
+     * @param hostTtlMs 主机这一层冻多久。网络类传 {@link #FAIL_HOST_NET_MS}：
+     *                  短冻是为了让界面自己好起来，不是为了省上报 —— 上报那边
+     *                  有 Report.Once 兜着，重复的那几条本来也发不出去。
+     */
+    static void rememberFailure(String url, String message, long hostTtlMs) {
         if (FAILED.size() > FAIL_CACHE_MAX) {
             FAILED.clear();
         }
@@ -123,7 +142,23 @@ final class SiteRepository {
             if (FAILED_HOSTS.size() > FAIL_CACHE_MAX) {
                 FAILED_HOSTS.clear();
             }
-            FAILED_HOSTS.put(host, System.currentTimeMillis() + FAIL_CACHE_MS);
+            FAILED_HOSTS.put(host, System.currentTimeMillis() + hostTtlMs);
+        }
+    }
+
+    /**
+     * 这张封面拿到了 —— 把它和它主机的「失败」记录一起抹掉。
+     *
+     * 缺这一条的时候，主机级缓存在成功之后仍然挂着，于是「第一次失败」的账
+     * 一直记到 TTL 到期：后面明明抓得回来，前 45 秒照样抛缓存里的旧异常。
+     */
+    static void forgetFailure(String url) {
+        if (url != null) {
+            FAILED.remove(url);
+        }
+        String host = hostOf(url);
+        if (host.length() > 0) {
+            FAILED_HOSTS.remove(host);
         }
     }
 
@@ -168,6 +203,35 @@ final class SiteRepository {
         } catch (Throwable ignored) {
             return "";
         }
+    }
+
+    /**
+     * 缓存键里要剔掉的签名参数（小写比较）。
+     *
+     * 黄果的每张封面上都挂着 {@code ?auth_key=<过期戳>-0-0-<md5>}，**每一批签名
+     * 都不一样**（2026-10-31 实测约 90 分钟换一轮）。把它算进缓存键，等于每 90
+     * 分钟把整个图床重下一遍；而「一次重下」就是「一次网络抖动 → 整页封面黑掉」
+     * 的触发条件。签名只决定「这张图给不给你看」，不决定「这张图是哪张」，
+     * 所以同一路径按其余业务参数命中同一份缓存是对的。
+     */
+    private static final java.util.Set<String> SIGNATURE_PARAMS =
+            new java.util.HashSet<String>(java.util.Arrays.asList(
+                    "auth_key", "sign", "signature", "token", "expires",
+                    "ossaccesskeyid", "x-oss-credential"));
+
+    /** 包可见：单测要盯住「签名剔了、业务参数留着」这两面。 */
+    static String cacheKeyQuery(String rawQuery) {
+        if (rawQuery == null || rawQuery.length() == 0) return "";
+        StringBuilder sb = new StringBuilder();
+        for (String pair : rawQuery.split("&")) {
+            if (pair.length() == 0) continue;
+            int eq = pair.indexOf('=');
+            String name = (eq < 0 ? pair : pair.substring(0, eq)).toLowerCase(Locale.ROOT);
+            if (SIGNATURE_PARAMS.contains(name)) continue;
+            if (sb.length() > 0) sb.append('&');
+            sb.append(pair);
+        }
+        return sb.toString();
     }
 
     /** 把「拿回来的到底是什么」写清楚，别再让人靠猜。包可见，方便单测盯住文案。 */
@@ -308,7 +372,10 @@ final class SiteRepository {
             rememberFailure(str, "不支持的封面格式：" + lowerCase + " @" + url.getHost());
             throw new IllegalArgumentException("不支持的封面格式：" + lowerCase + " @" + url.getHost());
         }
-        byte[] bArrDigest = MessageDigest.getInstance("SHA-256").digest((this.profile.fingerprint + ":" + url.getHost() + path).getBytes(StandardCharsets.UTF_8));
+        // 缓存键把 query 也算进去：同路径不同参数的封面是两张不同的图，
+        // 只 hash 到 path 会互相污染（?id=1 的图被 ?id=2 直接吃到缓存）。
+        // 但**签名参数不算**：见 cacheKeyQuery。
+        byte[] bArrDigest = MessageDigest.getInstance("SHA-256").digest((this.profile.fingerprint + ":" + url.getHost() + path + "?" + cacheKeyQuery(url.getQuery())).getBytes(StandardCharsets.UTF_8));
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 16; i++) {
             sb.append(String.format("%02x", Integer.valueOf(bArrDigest[i] & 255)));
@@ -316,26 +383,38 @@ final class SiteRepository {
         File file = new File(this.coverDir, ((Object) sb) + ".img");
         byte[] bArr = null;
         if (file.isFile()) {
-            byte[] allBytes = Files.readAllBytes(file.toPath());
-            if (repairConfiguredHeader(allBytes)) {
-                FileOutputStream fileOutputStream = new FileOutputStream(file);
-                try {
-                    fileOutputStream.write(allBytes);
-                    fileOutputStream.close();
-                } catch (Throwable th) {
-                    try {
-                        fileOutputStream.close();
-                    } catch (Throwable th2) {
-                        th.addSuppressed(th2);
-                    }
-                    throw th;
-                }
-            }
-            if (!validImage(allBytes)) {
+            byte[] allBytes = null;
+            try {
+                allBytes = Files.readAllBytes(file.toPath());
+            } catch (java.io.IOException gone) {
+                // isFile() 和 readAllBytes() 之间文件没了 —— trimCoverCache 在另一个
+                // 线程删的，或者系统清了 cache。这不是封面故障，当 miss 重抓就行。
+                // 线上那 70 条 FileNotFoundException（同一个 uid 150 的设备）就是它：
+                // 报成「封面失败」以后，用户看到的是灰块，而实际问题在缓存目录，
+                // 报错里那句 ENOENT 谁也猜不到这层意思。
                 file.delete();
-            } else {
-                file.setLastModified(System.currentTimeMillis());
-                bArr = allBytes;
+            }
+            if (allBytes != null) {
+                if (repairConfiguredHeader(allBytes)) {
+                    FileOutputStream fileOutputStream = new FileOutputStream(file);
+                    try {
+                        fileOutputStream.write(allBytes);
+                        fileOutputStream.close();
+                    } catch (Throwable th) {
+                        try {
+                            fileOutputStream.close();
+                        } catch (Throwable th2) {
+                            th.addSuppressed(th2);
+                        }
+                        throw th;
+                    }
+                }
+                if (!validImage(allBytes)) {
+                    file.delete();
+                } else {
+                    file.setLastModified(System.currentTimeMillis());
+                    bArr = allBytes;
+                }
             }
         }
         if (bArr == null) {
@@ -345,7 +424,10 @@ final class SiteRepository {
             } catch (Exception fetchError) {
                 // 抓不下来（超时、连接重置、图床回 4xx）就照原样抛 —— dispatch 会记一条。
                 // 同一条地址五分钟内再问，走上面的缓存，不再重复上报。
-                rememberFailure(str, fetchError.getMessage() == null ? "请求失败" : fetchError.getMessage());
+                // 但主机那一层只冻 45 秒：网络是活的，冻结期满就让它自己重试，
+                // 别让一次抖动把整页封面按死五分钟。
+                rememberFailure(str, fetchError.getMessage() == null ? "请求失败" : fetchError.getMessage(),
+                        FAIL_HOST_NET_MS);
                 throw fetchError;
             }
             String strOptString = this.profile.object("cover").optString("mode");
@@ -379,6 +461,9 @@ final class SiteRepository {
                 throw th3;
             }
         }
+        // 拿到图了 —— 这一条和它主机上的失败记录都作废。放在这儿（读缓存命中与
+        // 网络抓取两条路都汇到这点）是因为「成功」这个事实只在这里确定一次。
+        forgetFailure(str);
         byte b = bArr[0];
         if (b == -1) {
             str2 = Mime.IMAGE_JPEG;

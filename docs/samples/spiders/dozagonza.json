@@ -9,7 +9,8 @@
   "cover": {
     "mode": "plain",
     "allowedHosts": [
-      "img.dozagonza.com"
+      "img.dozagonza.com",
+      "pub2.bfzy.tv"
     ],
     "hostRewrites": {}
   },
