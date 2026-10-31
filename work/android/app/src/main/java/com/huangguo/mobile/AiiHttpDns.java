@@ -37,6 +37,12 @@ final class AiiHttpDns {
     private static final long TTL_OK = 10 * 60 * 1000L;
     private static final long TTL_FAIL = 60 * 1000L;
 
+    /** DoH 查询共用的底座 client（超时在此定）；查询时只换 DNS，复用连接池。 */
+    private static final OkHttpClient DOH_CLIENT = new OkHttpClient.Builder()
+            .connectTimeout(DOH_TIMEOUT, TimeUnit.SECONDS)
+            .readTimeout(DOH_TIMEOUT, TimeUnit.SECONDS)
+            .build();
+
     /** 解析缓存：host → IP 列表 + 到期时刻。 */
     private static final class Entry {
         final List<String> ips;
@@ -66,6 +72,21 @@ final class AiiHttpDns {
     /** 给 okhttp 的解析钩子。profile 为 null 时退回系统解析。 */
     static Dns dns(SiteProfile profile) {
         return new SmartDns(profile);
+    }
+
+    /**
+     * client 缓存键里 DNS 那一段的身份串。
+     *
+     * <p>SmartDns 的行为由 profile 决定（钉死的 hosts / DoH 配置全挂在上面），
+     * 只记类名的话所有源共用同一个键 —— A 源的请求会拿到按 B 源配置建好的 client。
+     * 所以 SmartDns 按 profile 的 fingerprint 区分；别的实现退化成类全名。
+     */
+    static String identity(Dns dns) {
+        if (dns instanceof SmartDns) {
+            SiteProfile p = ((SmartDns) dns).profile;
+            return "SmartDns:" + (p == null || p.fingerprint == null ? "" : p.fingerprint);
+        }
+        return dns.getClass().getName();
     }
 
     private static void log(String message) {
@@ -307,11 +328,10 @@ final class AiiHttpDns {
             }
         };
 
-        OkHttpClient dohClient = new OkHttpClient.Builder()
-                .dns(pinnedDns)
-                .connectTimeout(DOH_TIMEOUT, TimeUnit.SECONDS)
-                .readTimeout(DOH_TIMEOUT, TimeUnit.SECONDS)
-                .build();
+        // DoH 查询的共享 client：连接池/执行器只建这一份，各服务商只覆写
+        // 自己的钉死解析。之前每次查询都 new 一个全量 client 且用完不关，
+        // 线程和连接都在悄悄泄漏。
+        OkHttpClient dohClient = DOH_CLIENT.newBuilder().dns(pinnedDns).build();
 
         String endpoint = url + (url.indexOf('?') >= 0 ? "&" : "?") + "name=" + host + "&type=A";
         Request request = new Request.Builder()

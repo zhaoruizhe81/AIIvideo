@@ -225,9 +225,11 @@ public final class AiiHttp {
             // 表现就是读完超时（实测 AGE 的播放解析被这个卡住，同一条网络 curl 0.2 秒）。
             if (t instanceof java.net.SocketTimeoutException) return true;
             String m = t.getMessage() == null ? "" : t.getMessage().toLowerCase();
+            // 裸的 "timeout" 字样不再算数：URL 里带 timeout 的 4xx 也会命中，
+            // 把站点级失败误降级成 h1。真超时由上面的 SocketTimeoutException 判定。
             if (m.contains("unexpected end of stream") || m.contains("stream was reset")
                     || m.contains("connection reset") || m.contains("broken pipe")
-                    || m.contains("protocol error") || m.contains("timeout")) return true;
+                    || m.contains("protocol error")) return true;
             t = t.getCause();
         }
         return false;
@@ -332,13 +334,12 @@ public final class AiiHttp {
         log("GET " + hostOfUrl(url) + pathOfUrl(url));
         OkHttpClient http = client(profile);
         if (timeoutSeconds > 0) {
-            OkHttpClient.Builder timed = new OkHttpClient.Builder()
+            // 必须从现有 client 派生（newBuilder 继承拦截器/连接池），只覆写超时。
+            // 裸 new Builder 会把重定向链记录拦截器丢掉，撞环时只剩数字没有路径。
+            http = http.newBuilder()
                     .connectTimeout(timeoutSeconds, TimeUnit.SECONDS)
-                    .readTimeout(timeoutSeconds, TimeUnit.SECONDS);
-            if (http.dns() != null) timed.dns(http.dns());
-            if (http.proxy() != null) timed.proxy(http.proxy());
-            if (http.proxyAuthenticator() != null) timed.proxyAuthenticator(http.proxyAuthenticator());
-            http = timed.build();
+                    .readTimeout(timeoutSeconds, TimeUnit.SECONDS)
+                    .build();
         }
         // h2 被中途掐断就降级 h1 重试一次 —— 和 fetchUncached 同一条规矩。
         // 出口节点抖的时候实测就是这个形态：18 秒后 Connection reset，重试才过。
@@ -347,14 +348,14 @@ public final class AiiHttp {
         } catch (IOException e) {
             if (!isStreamBreak(e)) throw e;
             log("HTTP/2 被重置，降级 HTTP/1.1 重试 " + pathOfUrl(url));
-            OkHttpClient.Builder h1 = new OkHttpClient.Builder()
+            // 同样从现有 client 派生：dns/proxy/认证随 newBuilder 原样继承，
+            // 不再手工挑着抄（之前那样漏掉了拦截器和连接池）。
+            OkHttpClient h1 = http.newBuilder()
                     .connectTimeout(http.connectTimeoutMillis(), TimeUnit.MILLISECONDS)
-                    .readTimeout(http.readTimeoutMillis(), TimeUnit.MILLISECONDS);
-            if (http.dns() != null) h1.dns(http.dns());
-            if (http.proxy() != null) h1.proxy(http.proxy());
-            if (http.proxyAuthenticator() != null) h1.proxyAuthenticator(http.proxyAuthenticator());
-            h1.protocols(java.util.Collections.singletonList(okhttp3.Protocol.HTTP_1_1));
-            return getWith(h1.build(), url, headers, profile, cookieOut);
+                    .readTimeout(http.readTimeoutMillis(), TimeUnit.MILLISECONDS)
+                    .protocols(java.util.Collections.singletonList(okhttp3.Protocol.HTTP_1_1))
+                    .build();
+            return getWith(h1, url, headers, profile, cookieOut);
         }
     }
 
@@ -778,7 +779,10 @@ public final class AiiHttp {
         } catch (IOException e) {
             // 代理不通就退回直连试一次：订阅地址可能是国内的自建服务，
             // 走机场节点反而绕远甚至被拒。
-            if (route == null) throw e;
+            // 只退两类：这次真的走了代理（route != null），且失败在连接层
+            // （isConnectFailure —— "HTTP 404" 说明请求已穿过代理到达对方，
+            // 再直连一次只会拿到另一个答案，把真正的站点错误盖掉）。
+            if (route == null || !isConnectFailure(e)) throw e;
             log("订阅下载走代理失败（" + e.getMessage() + "），改直连重试");
             return executeOnce(request, null, timeoutSeconds, url);
         }
@@ -1041,7 +1045,9 @@ public final class AiiHttp {
         String key = (http1 ? "h1" : "h2")
                 + "|" + connectSeconds + "/" + readSeconds
                 + "|" + (route == null ? "direct" : route.key())
-                + "|" + (dns == null ? "system" : dns.getClass().getSimpleName());
+                // DNS 身份要带全：SmartDns 按 profile 的 fingerprint 区分，
+                // 只记类名的话不同源的钉死 hosts / DoH 配置会互相串。
+                + "|" + (dns == null ? "system" : AiiHttpDns.identity(dns));
         OkHttpClient hit = CLIENTS.get(key);
         if (hit != null) return hit;
 

@@ -76,10 +76,14 @@ final class RouteMemory {
      */
     static String opinion(String host) {
         if (host == null || host.length() == 0) return null;
-        Entry e = entries().get(host);
-        if (e == null) return null;
-        if (System.currentTimeMillis() - e.at > TTL_MS) return null;
-        return e.route;
+        // 读也进同一把锁：否则首次加载的 reload 可能插在 learn 的
+        // 「取快照 → 提交」之间，后提交者拿旧快照覆盖 cache，丢更新。
+        synchronized (RouteMemory.class) {
+            Entry e = entries().get(host);
+            if (e == null) return null;
+            if (System.currentTimeMillis() - e.at > TTL_MS) return null;
+            return e.route;
+        }
     }
 
     /** 记一条「这条路成功过」。原子写盘；写失败只丢记忆，不影响请求本身。 */

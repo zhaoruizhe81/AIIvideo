@@ -392,11 +392,43 @@ final class AppStore {
         return new JSONObject().put("bookmarks", bookmarkMap).put("history", historyMap).put("bookmarkDeleted", object("bookmarkDeleted")).put("historyDeleted", object("historyDeleted"));
     }
 
-    /** 云端拉回来的快照并到本地：墓碑优先删，同 key 比 updated_at，最后整体落盘。 */
+    /** 云端拉回来的快照并到本地：墓碑优先删，同 key 比时间戳，最后整体落盘。 */
     synchronized void applyCloudSnapshot(JSONObject snapshot) throws Exception {
         JSONObject cloudBookmarks = snapshot.optJSONObject("bookmarks");
         JSONObject cloudHistory = snapshot.optJSONObject("history");
+        JSONObject cloudBookmarkDeleted = snapshot.optJSONObject("bookmarkDeleted");
         JSONObject cloudHistoryDeleted = snapshot.optJSONObject("historyDeleted");
+        // 收藏那半和进度走同一套墓碑合并：本地有、云端无、且没被云端墓碑标记的
+        // 键保留，否则多设备场景下本地还没上过云的收藏会被整份覆盖掉。
+        JSONObject bookmarks = object("bookmarks");
+        if (cloudBookmarkDeleted != null) {
+            ArrayList expired = new ArrayList();
+            Iterator<String> keys = bookmarks.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                JSONObject entry = bookmarks.optJSONObject(key);
+                if (entry != null && cloudBookmarkDeleted.optLong(entry.optString(Text.ATTR_ID)) >= entry.optLong("addedAt")) {
+                    expired.add(key);
+                }
+            }
+            Iterator it = expired.iterator();
+            while (it.hasNext()) {
+                bookmarks.remove((String) it.next());
+            }
+        }
+        if (cloudBookmarks != null) {
+            Iterator<String> cloudIds = cloudBookmarks.keys();
+            while (cloudIds.hasNext()) {
+                String bookmarkId = cloudIds.next();
+                JSONObject cloudEntry = cloudBookmarks.optJSONObject(bookmarkId);
+                if (cloudEntry != null) {
+                    JSONObject localEntry = bookmarks.optJSONObject(bookmarkId);
+                    if (localEntry == null || cloudEntry.optLong("addedAt") >= localEntry.optLong("addedAt")) {
+                        bookmarks.put(bookmarkId, cloudEntry);
+                    }
+                }
+            }
+        }
         JSONObject progress = object(NotificationCompat.CATEGORY_PROGRESS);
         if (cloudHistoryDeleted != null) {
             ArrayList expired = new ArrayList();
@@ -428,7 +460,8 @@ final class AppStore {
             }
         }
         trimProgress(progress);
-        this.preferences.edit().putString(scoped("bookmarks"), cloudBookmarks == null ? "{}" : cloudBookmarks.toString()).putString(scoped(NotificationCompat.CATEGORY_PROGRESS), progress.toString()).putString(scoped("bookmarkDeleted"), snapshot.optJSONObject("bookmarkDeleted") == null ? "{}" : snapshot.getJSONObject("bookmarkDeleted").toString()).putString(scoped("historyDeleted"), cloudHistoryDeleted == null ? "{}" : cloudHistoryDeleted.toString()).apply();
+        // bookmarks/bookmarkDeleted 落盘的是合并结果，不再整份照抄云端。
+        this.preferences.edit().putString(scoped("bookmarks"), bookmarks.toString()).putString(scoped(NotificationCompat.CATEGORY_PROGRESS), progress.toString()).putString(scoped("bookmarkDeleted"), cloudBookmarkDeleted == null ? "{}" : cloudBookmarkDeleted.toString()).putString(scoped("historyDeleted"), cloudHistoryDeleted == null ? "{}" : cloudHistoryDeleted.toString()).apply();
     }
 
     synchronized void clearHistory() {

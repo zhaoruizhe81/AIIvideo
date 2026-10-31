@@ -44,11 +44,22 @@ import java.util.Locale;
  */
 final class NetRoute {
 
-    /** 必须走代理的域名。来自源的 net.proxy，子域自动命中。 */
-    private static volatile List<String> PROXY_HOSTS = new ArrayList<String>();
+    /**
+     * 一次 {@link #configure} 的不可变快照：代理域表 + 是否声明，两件事绑在一个
+     * 对象里，用**一个** volatile 引用发布。之前是两个 volatile 各写各的，读侧
+     * 可能拿到「新表 + 旧 declared」的撕裂视图 —— directOnly 与 mustProxy 会
+     * 对同一个域给出相反的判定。
+     */
+    private static final class Snapshot {
+        final List<String> proxyHosts;
+        final boolean declared;
+        Snapshot(List<String> proxyHosts, boolean declared) {
+            this.proxyHosts = proxyHosts;
+            this.declared = declared;
+        }
+    }
 
-    /** 当前源是否声明了 net 块。声明了就不再参考全局开关与 DirectHosts。 */
-    private static volatile boolean declared = false;
+    private static volatile Snapshot snapshot = new Snapshot(new ArrayList<String>(), false);
 
     /**
      * 当前源声明的代理域名表（未声明返回空表）。给 {@link XrayConfig#routing} 用：
@@ -59,7 +70,7 @@ final class NetRoute {
      * 的签名一路改穿 ProxyConsole。
      */
     static List<String> declaredProxyHosts() {
-        return new ArrayList<String>(PROXY_HOSTS);
+        return new ArrayList<String>(snapshot.proxyHosts);
     }
 
     private NetRoute() {}
@@ -100,8 +111,8 @@ final class NetRoute {
             String host = hostOf(origin);
             if (host.length() > 0 && !hosts.contains(host)) hosts.add(host);
         }
-        PROXY_HOSTS = hosts;
-        declared = has;
+        // 整份快照一次发布：读侧要么看到旧的一对，要么看到新的一对。
+        snapshot = new Snapshot(hosts, has);
     }
 
     /**
@@ -122,7 +133,7 @@ final class NetRoute {
 
     /** 当前源有没有声明路由。没声明时调用方退回老规则。 */
     static boolean declared() {
-        return declared;
+        return snapshot.declared;
     }
 
     /**
@@ -131,7 +142,7 @@ final class NetRoute {
      * 那是显式决定，连接层失败也不该被路由记忆改写。
      */
     static boolean isDeclared() {
-        return declared;
+        return snapshot.declared;
     }
 
     /**
@@ -148,10 +159,12 @@ final class NetRoute {
     static boolean directOnly(String host) {
         if (host == null || host.length() == 0) return false;
         String h = host.toLowerCase(Locale.ROOT).trim();
+        // 同一次判定里表和 declared 必须出自同一份快照。
+        Snapshot s = snapshot;
         boolean direct;
-        if (declared) {
+        if (s.declared) {
             // 「声明了要代理，但根本没代理可用」按直连处理 —— 理由见 proxyUnavailable。
-            direct = !matches(PROXY_HOSTS, h) || proxyUnavailable(h);
+            direct = !matches(s.proxyHosts, h) || proxyUnavailable(s, h);
         } else {
             direct = DirectHosts.isDirect(h);
         }
@@ -188,10 +201,14 @@ final class NetRoute {
      * 而真相是「你没开代理」。
      */
     static boolean proxyUnavailable(String host) {
+        return proxyUnavailable(snapshot, host);
+    }
+
+    private static boolean proxyUnavailable(Snapshot s, String host) {
         if (host == null || host.length() == 0) return false;
-        if (!declared) return false;                  // 没声明 → 老规则自己会处理
+        if (!s.declared) return false;                  // 没声明 → 老规则自己会处理
         String h = host.toLowerCase(Locale.ROOT).trim();
-        if (!matches(PROXY_HOSTS, h)) return false;    // 不在代理表，本来就该直连
+        if (!matches(s.proxyHosts, h)) return false;    // 不在代理表，本来就该直连
         return AiiHttp.effectiveProxy().length() == 0;
     }
 
@@ -223,7 +240,8 @@ final class NetRoute {
     static boolean mustProxy(String host) {
         if (host == null || host.length() == 0) return false;
         String h = host.toLowerCase(Locale.ROOT).trim();
-        if (declared) return matches(PROXY_HOSTS, h);
+        Snapshot s = snapshot;
+        if (s.declared) return matches(s.proxyHosts, h);
         // 没声明：沿用老语义 —— 只要全局代理开着，非直连域就该走代理。
         if (AiiHttp.effectiveProxy().length() == 0) return false;
         return !DirectHosts.isDirect(h);
@@ -240,7 +258,8 @@ final class NetRoute {
 
     /** 给日志用：当前路由的一句话摘要。 */
     static String describe() {
-        if (!declared) return "未声明（老规则：DirectHosts + 全局开关）";
-        return "代理域 " + PROXY_HOSTS.size() + " 个，其余直连：" + PROXY_HOSTS;
+        Snapshot s = snapshot;
+        if (!s.declared) return "未声明（老规则：DirectHosts + 全局开关）";
+        return "代理域 " + s.proxyHosts.size() + " 个，其余直连：" + s.proxyHosts;
     }
 }

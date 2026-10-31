@@ -521,11 +521,13 @@ final class Subscription {
         if ("ss".equals(type)) {
             String cipher = p.get("cipher");
             if (cipher == null || cipher.isEmpty()) return;
-            out.add("ss://" + cipher + ":" + (pass == null ? "" : pass) + "@" + server + ":" + port + hash);
+            // 密码必须编码：带 @ / # 时会把后面那段错切成 host（hy2 分支同款写法）。
+            out.add("ss://" + cipher + ":" + (pass == null ? "" : urlEncode(pass))
+                    + "@" + server + ":" + port + hash);
             return;
         }
         if ("trojan".equals(type)) {
-            out.add("trojan://" + (pass == null ? "" : pass) + "@" + server + ":" + port
+            out.add("trojan://" + (pass == null ? "" : urlEncode(pass)) + "@" + server + ":" + port
                     + "?security=tls" + hash);
             return;
         }

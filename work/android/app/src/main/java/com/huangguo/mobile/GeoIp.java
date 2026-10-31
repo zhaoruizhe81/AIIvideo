@@ -41,7 +41,9 @@ final class GeoIp {
     private static boolean failed;
 
     /** 上次查过的答案。测速一轮里同一台机器可能被查好几次。 */
-    private static final java.util.HashMap<String, String> cache = new java.util.HashMap<String, String>();
+    // ConcurrentHashMap：测速线程写、UI 线程读，裸 HashMap 并发下会丢条目甚至死循环。
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> cache =
+            new java.util.concurrent.ConcurrentHashMap<String, String>();
 
     private GeoIp() {}
 

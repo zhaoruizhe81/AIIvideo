@@ -26,7 +26,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONObject;
-import org.videolan.libvlc.MediaPlayer;
 
 /**
  * AIIvideo —— 账号服务。
@@ -451,7 +450,9 @@ final class AccountService {
         } else if (attributeInt == 3) {
             rotation = 180;
         } else if (attributeInt == 8) {
-            rotation = MediaPlayer.Event.PausableChanged;
+            // 修复反编译错位：原来被换成 MediaPlayer.Event.PausableChanged（267）。
+            // EXIF orientation 8 = 拍的时候横握，回正要顺时针转 270 度。
+            rotation = 270;
         }
         if (rotation != 0) {
             Matrix matrix = new Matrix();

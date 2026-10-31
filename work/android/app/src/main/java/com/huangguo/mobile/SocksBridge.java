@@ -29,9 +29,11 @@ final class SocksBridge {
         Thread thread = new Thread(new Runnable() {
             @Override
             public void run() {
+                int failures = 0;
                 while (true) {
                     try {
                         final java.net.Socket client = server.accept();
+                        failures = 0;
                         Thread worker = new Thread(new Runnable() {
                             @Override
                             public void run() {
@@ -41,7 +43,14 @@ final class SocksBridge {
                         worker.setDaemon(true);
                         worker.start();
                     } catch (Throwable e) {
-                        return;   // server 被关掉了，线程退出
+                        // 瞬时异常（EMFILE 之类）不能把线程杀掉：port 仍 >0，
+                        // ensure() 会一直返回这个死端口。只有 server 真被关了才退；
+                        // 其余记日志继续，连挂 8 次再退，防异常风暴空转烧 CPU。
+                        if (server == null || server.isClosed()) return;
+                        failures++;
+                        log("accept 失败(" + failures + ")：" + e);
+                        if (failures >= 8) return;
+                        try { Thread.sleep(50); } catch (InterruptedException ie) { return; }
                     }
                 }
             }

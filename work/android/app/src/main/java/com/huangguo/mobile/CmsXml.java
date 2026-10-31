@@ -47,8 +47,10 @@ import java.util.regex.Pattern;
 final class CmsXml {
 
     private static final Pattern VIDEO = Pattern.compile("<video>(.*?)</video>", Pattern.DOTALL);
-    private static final Pattern DD = Pattern.compile("<dd[^>]*>(.*?)</dd>", Pattern.DOTALL);
-    private static final Pattern DD_FLAG = Pattern.compile("<dd[^>]*flag=\"([^\"]*)\"[^>]*>(.*?)</dd>", Pattern.DOTALL);
+    /** <dd> 整条匹配：group(1) 是属性段（可缺省），group(2) 是标签体。flags/urls 共用这一条正则。 */
+    private static final Pattern DD_FULL = Pattern.compile("<dd([^>]*)>(.*?)</dd>", Pattern.DOTALL);
+    /** flag 属性的值，单/双引号都认（老源里两种都出现过）。 */
+    private static final Pattern FLAG_ATTR = Pattern.compile("flag\\s*=\\s*([\"'])(.*?)\\1");
     private static final Pattern TY = Pattern.compile("<ty[^>]*id=\"([^\"]*)\"[^>]*>(.*?)</ty>", Pattern.DOTALL);
     private static final Pattern ATTR = Pattern.compile("(\\w+)=\"([^\"]*)\"");
 
@@ -121,26 +123,36 @@ final class CmsXml {
         return v;
     }
 
+    /**
+     * 单遍扫描 <dl> 里的 <dd>，同时产出线路名和地址（$$$ 拼，跟 JSON 那套一致）。
+     *
+     * <p>必须同源：原来 flags 只认 flag="…" 双引号、urls 认所有 <dd>，两个计数
+     * 对不上时线路名和地址就错位了。现在两者从同一条正则的同一轮匹配里来，
+     * 两个列表永远等长、按下标一一对应；没有 flag 属性的条目线路名记空串。
+     */
+    private static String[] ddLines(String body) {
+        StringBuilder flags = new StringBuilder();
+        StringBuilder urls = new StringBuilder();
+        Matcher m = DD_FULL.matcher(body);
+        while (m.find()) {
+            Matcher f = FLAG_ATTR.matcher(m.group(1));
+            String flag = f.find() ? f.group(2) : "";
+            if (flags.length() > 0) flags.append("$$$");
+            flags.append(flag);
+            if (urls.length() > 0) urls.append("$$$");
+            urls.append(text(m.group(2)));
+        }
+        return new String[]{flags.toString(), urls.toString()};
+    }
+
     /** <dl> 里各条 <dd flag="…"> 的 flag，多条用 $$$ 拼（跟 JSON 那套的格式一致）。 */
     private static String playFlags(String body) {
-        StringBuilder sb = new StringBuilder();
-        Matcher m = DD_FLAG.matcher(body);
-        while (m.find()) {
-            if (sb.length() > 0) sb.append("$$$");
-            sb.append(m.group(1));
-        }
-        return sb.toString();
+        return ddLines(body)[0];
     }
 
     /** 各条 <dd> 的内容，多条用 $$$ 拼。 */
     private static String playUrls(String body) {
-        StringBuilder sb = new StringBuilder();
-        Matcher m = DD.matcher(body);
-        while (m.find()) {
-            if (sb.length() > 0) sb.append("$$$");
-            sb.append(text(m.group(1)));
-        }
-        return sb.toString();
+        return ddLines(body)[1];
     }
 
     /** 取一个标签的内容。取不到返回空串（不返回 null，上面到处在用它拼字符串）。 */

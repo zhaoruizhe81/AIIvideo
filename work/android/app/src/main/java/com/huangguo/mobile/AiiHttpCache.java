@@ -120,6 +120,9 @@ final class AiiHttpCache {
                         PREFETCH.put(hotKey, new Prefetch(body));
                         log("预热完成 " + path + " " + body.length + " 字节 "
                                 + (System.currentTimeMillis() - started) + "ms");
+                        // 成功收尾顺手清扫：跨源/跨代次的残留不会自己消失
+                        //（take 只按 key 精确摘除），就在这里一并处理。
+                        sweepStale();
                     } else if (body != null && body.length > 0) {
                         log("预热作废（期间换过源）" + body.length + " 字节");
                     }
@@ -143,6 +146,39 @@ final class AiiHttpCache {
         if (scheme < 0) return url;
         int slash = url.indexOf('/', scheme + 3);
         return slash < 0 ? url : url.substring(slash);
+    }
+
+    /** PREFETCH 的容量上限。超过时按落入时间留最新这几份。 */
+    private static final int PREFETCH_KEEP = 4;
+
+    /**
+     * 预热成功收尾的顺手清扫。
+     *
+     * <ul>
+     *   <li>WARMING：在飞记录只在 take/warmup 里按 key 精确摘除，换源之后旧 key
+     *       再也没人来取，过期的条目就一直躺着 —— 这里把 fresh()==false 的清掉
+     *       （remove(key, value) 只删还是原来那个的，不伤并发中新增的）。</li>
+     *   <li>PREFETCH：按 key（路径）累积，旧源首页不会被取走只会越攒越多；
+     *       超过 {@link #PREFETCH_KEEP} 份时按时间留最新几份，其余移除。</li>
+     * </ul>
+     */
+    private static void sweepStale() {
+        for (java.util.Map.Entry<String, Warmup> e : WARMING.entrySet()) {
+            if (!e.getValue().fresh()) WARMING.remove(e.getKey(), e.getValue());
+        }
+        if (PREFETCH.size() <= PREFETCH_KEEP) return;
+        java.util.ArrayList<java.util.Map.Entry<String, Prefetch>> all =
+                new java.util.ArrayList<java.util.Map.Entry<String, Prefetch>>(PREFETCH.entrySet());
+        // 排序基于各自的时间戳，与 ConcurrentHashMap 的遍历顺序无关。
+        java.util.Collections.sort(all, new java.util.Comparator<java.util.Map.Entry<String, Prefetch>>() {
+            @Override public int compare(java.util.Map.Entry<String, Prefetch> a,
+                                         java.util.Map.Entry<String, Prefetch> b) {
+                return Long.compare(b.getValue().at, a.getValue().at);
+            }
+        });
+        for (int i = PREFETCH_KEEP; i < all.size(); i++) {
+            PREFETCH.remove(all.get(i).getKey(), all.get(i).getValue());
+        }
     }
 
 private static byte[] prefetchBody(SiteProfile profile, Fetcher fetcher) throws Exception {

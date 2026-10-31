@@ -53,7 +53,6 @@ import java.util.concurrent.Executors;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.json.JSONTokener;
-import org.videolan.libvlc.MediaDiscoverer;
 
 /**
  * 主界面。整个应用就这一个 Activity（播放器另有 VlcPlayerActivity，从原生播放器起）。
@@ -183,7 +182,11 @@ public final class MainActivity extends Activity {
         }
         this.updates = new UpdateManager(this);
         int i = getApplicationInfo().flags & 2;
-        WebView.setWebContentsDebuggingEnabled(true);
+        // 只有 debuggable 构建（FLAG_DEBUGGABLE）才开 WebView 远程调试，
+        // release 包里无条件开等于给任何一台 USB 连着的机器留检查器。
+        if (i != 0) {
+            WebView.setWebContentsDebuggingEnabled(true);
+        }
         this.root = new FrameLayout(this);
         WebView webView = new WebView(this);
         this.webView = webView;
@@ -359,7 +362,9 @@ public final class MainActivity extends Activity {
 
     private boolean dark() {
         int iOverride = ThemeBridge.override();
-        if (iOverride == -1) {
+        // 修复反编译错位：-1 是「跟随系统」，显式选择（0 浅 / 1 深）要直接生效。
+        // 原来的 iOverride == -1 恒为真，用户选浅色也永远按深色画。
+        if (iOverride != -1) {
             return iOverride != 0;
         }
         return (getResources().getConfiguration().uiMode & 48) == 32;
@@ -404,7 +409,10 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 29) {
             getWindow().setStatusBarContrastEnforced(false);
         }
-        int i = !zDark ? 1296 : MediaDiscoverer.Event.Started;
+        // 修复反编译错位：原深色分支被错位成 MediaDiscoverer.Event.Started。
+        // 0x510 布局旗标 = LAYOUT_STABLE | LAYOUT_FULLSCREEN | LIGHT_NAVIGATION_BAR，
+        // 浅色挂着、深色清空；下面 |= 8192（LIGHT_STATUS_BAR）的分支不动。
+        int i = zDark ? 0 : 0x510;
         if (!zDark && !this.detailSystemBars) {
             i |= 8192;
         }
@@ -449,7 +457,9 @@ public final class MainActivity extends Activity {
             this.pendingUpdateApk = null;
             if (getPackageManager().canRequestPackageInstalls()) {
                 openUpdateInstaller(file);
-            } else {
+            } else if (this.webView != null) {
+                // 渲染进程崩掉后 webView 已置 null（onRenderProcessGone），recreate
+                // 前插进来的一次 resume 不能再往它上发 JavaScript。
                 this.webView.evaluateJavascript("window.hgUpdateInstallPermissionDenied && window.hgUpdateInstallPermissionDenied()", null);
             }
         }

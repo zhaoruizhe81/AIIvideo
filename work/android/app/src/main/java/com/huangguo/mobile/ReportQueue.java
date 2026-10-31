@@ -179,6 +179,12 @@ final class ReportQueue {
                 break;
             }
         }
+        // 因 break 没进本批的 .sending 要立刻改回 .jsonl：还原残件的
+        // recoverSending 只在启动跑一次，这里不还回去的话，超出单批的那部分
+        // 事件在本进程里就永远躺在 .sending 上，再也不会被发送。
+        for (int i = claimed.size(); i < sending.size(); i++) {
+            release(sending.get(i));
+        }
         if (total == 0) {
             for (File file : sending) {
                 release(file);
@@ -520,7 +526,9 @@ final class ReportQueue {
     /** 没发出去：改回普通队列文件。 */
     private void release(File file) {
         String name = file.getName();
-        if (!name.endsWith(SENDING)) {
+        // isFile 守卫：上面那步已经改回去过的文件（发送异常的 catch 会再全量放一遍）
+        // 直接跳过，别在恢复路径上刷「改名失败」的假警。
+        if (!name.endsWith(SENDING) || !file.isFile()) {
             return;
         }
         File target = new File(this.dir, name.substring(0, name.length() - SENDING.length()));

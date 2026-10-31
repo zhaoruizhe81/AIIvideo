@@ -1438,7 +1438,11 @@ final class SiteFetchWebView {
                 });
             }
         });
-        latch.await(6, TimeUnit.SECONDS);
+        if (!latch.await(6, TimeUnit.SECONDS)) {
+            // runnable 没跑 = 主线程被占，不是求值失败：返回空串会让上层把
+            // 「主线程卡了」误诊成「图片没加载出来」。
+            throw new IllegalStateException("等待主线程超时：图片通道 JS 求值没执行（主线程被占住）");
+        }
         return out[0];
     }
 
@@ -1478,7 +1482,11 @@ final class SiteFetchWebView {
                 }
             }
         });
-        latch.await(8, TimeUnit.SECONDS);
+        if (!latch.await(8, TimeUnit.SECONDS)) {
+            // runnable 没跑 = 主线程被占：往下走只会误报「没建出 WebView」，
+            // 让上层把「主线程卡了」当成图片通道坏了。
+            throw new IllegalStateException("等待主线程超时：图片通道 WebView 没建出来（主线程被占住）");
+        }
         if (failed[0] != null) throw new IOException("图片通道起不来：" + failed[0]);
         if (imageView == null) throw new IOException("图片通道起不来（没建出 WebView）");
     }
@@ -1562,7 +1570,9 @@ final class SiteFetchWebView {
                 }
             }
             cm.flush();
-            cookieApplied = true;
+            // 只有真的写进去过才置位：全被拒时置 true 会让这里永远不再重试，
+            // clearance 一过期就再也注入不回去了。
+            if (wrote > 0) cookieApplied = true;
             // 回读验证：写完立刻 getCookie，读不回来 = 写失败（数据目录/域规则问题），
             // 这行日志能把「注入了但没用」和「根本没注入」一次分清。
             String readBack = cm.getCookie(origin);

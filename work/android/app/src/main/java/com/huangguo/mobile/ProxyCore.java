@@ -553,7 +553,16 @@ public final class ProxyCore {
         return equal(a.protocol, b.protocol) && equal(a.server, b.server) && a.port == b.port
                 && equal(a.uuid, b.uuid) && equal(a.method, b.method) && a.alterId == b.alterId
                 && equal(a.network, b.network) && equal(a.tls, b.tls) && equal(a.path, b.path)
-                && equal(a.host, b.host);
+                && equal(a.host, b.host)
+                // 这批字段直接决定握手（reality 的 pbk/sid/fp、vless 的 flow、
+                // hy2 的带宽）—— 漏比的话换源 reapplyRouting() 会把换过源的
+                // 节点当成「同一个」，拿缺参配置重新起核心，握手必失败。
+                && equal(a.security, b.security) && equal(a.fingerprint, b.fingerprint)
+                && equal(a.flow, b.flow) && equal(a.serviceName, b.serviceName)
+                && equal(a.publicKey, b.publicKey) && equal(a.shortId, b.shortId)
+                && a.allowInsecure == b.allowInsecure
+                && a.upMbps == b.upMbps && a.downMbps == b.downMbps
+                && equal(a.sni, b.sni);
     }
 
     private static boolean equal(String a, String b) {
@@ -574,6 +583,14 @@ public final class ProxyCore {
         node.fingerprint = source.fingerprint;
         node.flow = source.flow;
         node.serviceName = source.serviceName;
+        // reality / hy2 的握手参数与带宽估算必须跟着走：漏复制的后果是
+        // reapplyRouting() 用缺参配置重启核心，节点连握手都过不去。
+        node.publicKey = source.publicKey;
+        node.shortId = source.shortId;
+        node.allowInsecure = source.allowInsecure;
+        node.upMbps = source.upMbps;
+        node.downMbps = source.downMbps;
+        node.sni = source.sni;
         return node;
     }
 

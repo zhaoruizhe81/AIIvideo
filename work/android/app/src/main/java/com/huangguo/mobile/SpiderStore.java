@@ -210,6 +210,12 @@ final class SpiderStore {
         try {
             out.write(raw);
             out.getFD().sync();
+        } catch (IOException writeError) {
+            // 写一半抛异常时清掉残件：.js.tmp 留在目录里，下次扫描会冒出一个
+            // 调不动的孤儿。delete 必须只挂在失败路径上 —— 放进 finally 的话
+            // 成功路径会在 rename 之前把 tmp 删掉，install 永远「写不进去」。
+            tmp.delete();
+            throw writeError;
         } finally {
             out.close();
         }

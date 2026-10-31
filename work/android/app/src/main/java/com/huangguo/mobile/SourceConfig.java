@@ -669,13 +669,26 @@ final class SourceConfig {
 
 
     static void writeJson(File target, JSONObject value) throws IOException {
+        // 原子写：先落 <名>.tmp 再 renameTo 目标，进程被杀也不会留下半截 JSON。
+        // 改名失败删掉 tmp、原文件保持不动（写法对齐 ReportQueue.rewrite）。
+        File tmp = new File(target.getParentFile(), target.getName() + ".tmp");
         FileOutputStream out = null;
+        boolean written = false;
         try {
-            out = new FileOutputStream(target);
+            out = new FileOutputStream(tmp);
             out.write(value.toString().getBytes("UTF-8"));
             out.flush();
+            out.getFD().sync();
+            written = true;
         } finally {
             UserSource.close(out);
+            if (!written) {
+                tmp.delete();           // 写一半的残件别留在目录里
+            }
+        }
+        if (!tmp.renameTo(target)) {
+            tmp.delete();
+            throw new IOException("写配置失败（rename）：" + target);
         }
     }
     /**
@@ -769,13 +782,27 @@ final class SourceConfig {
 
 
     static void save(Context context, JSONObject config) throws IOException {
+        // 原子写：先落 .tmp 再 renameTo（同 writeJson），user-source.json 被杀
+        // 在半路时保住上一份完整配置，而不是留一个解析不了的空壳。
+        File target = file(context);
+        File tmp = new File(target.getParentFile(), target.getName() + ".tmp");
         FileOutputStream out = null;
+        boolean written = false;
         try {
-            out = new FileOutputStream(file(context));
+            out = new FileOutputStream(tmp);
             out.write(config.toString().getBytes("UTF-8"));
             out.flush();
+            out.getFD().sync();
+            written = true;
         } finally {
             UserSource.close(out);
+            if (!written) {
+                tmp.delete();           // 写一半的残件别留在目录里
+            }
+        }
+        if (!tmp.renameTo(target)) {
+            tmp.delete();
+            throw new IOException("写配置失败（rename）：" + target);
         }
     }
 

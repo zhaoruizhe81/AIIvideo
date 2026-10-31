@@ -217,6 +217,11 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
     private int warmingPos = -1;
     /** 防抖：等当前这一页的硬解实例建好再去抢第二份，见 prewarmNeighbor。 */
     private int prewarmPending = -1;
+    /**
+     * play() 之后欠着没落的续播点。play() 一回来 demuxer 还没建，setTime 会被
+     * 直接丢掉 —— 等 LengthChanged 事件到了再落，和单集模式 startedAt 一套机制。
+     */
+    private long pendingResume;
     private final Runnable prewarmRunnable = new Runnable() {
         @Override public void run() {
             int pos = prewarmPending;
@@ -710,6 +715,13 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             releaseFeedPlayers();
             // 换集：五个集合 + 换线游标 + 续播现场一起清。
             session.reset();
+            // 预热账本和结束标记都是上一部的，不复位的话换集后 playPage 会把
+            // 旧页当成暖的直接 play，play_end 还会把 finished 误报成 true。
+            sawEnd = false;
+            warmPos = -1;
+            warmUrl = "";
+            warmingPos = -1;
+            pendingResume = 0;
         }
         closePlayer();
         startPlayback();
@@ -1473,7 +1485,9 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         // 1.5 秒就抬音量等于没等。
         ui.postDelayed(unmuteRunnable, 3000);
         mp.play();
-        if (resume > 2000) mp.setTime(resume);
+        // play() 后立刻 setTime 会被丢（还没有 demuxer，见单集模式 startVlc 里
+        // 那段注释），先记下来，等 LengthChanged 事件再落。
+        pendingResume = resume;
         if (Math.abs(feedRate - 1f) > 0.01f) mp.setRate(feedRate);
         // 兜底：setMedia 之后 VLC 有可能重建 vout，而页面此时可能才布局完。
         attachVout(pos, true);
@@ -1550,7 +1564,9 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         if (pos == curPos && playerFor(pos) != null && playerFor(pos) == activeFeedPlayer) return;
         curPos = pos;
         updateEpisodeUi();
-        persistFeedProgress();
+        // 落盘不在这儿做：此刻 activeFeedPlayer 还指着上一集的 player，会写出
+        // 「新集号 + 旧集位置」的记录。挪到 playPage 认领完新 player 之后（两条
+        // 播放路径里各一次）。
         ui.removeCallbacks(prewarmRunnable);
         prewarmPending = -1;
         // 滑走就闭嘴：上一集的声音不能跟着新的一页继续响。地址还没到之前
@@ -1566,6 +1582,8 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         String url = session.urlOf(pos);
         if (url != null) {
             playPage(pos, url);
+            // 到这儿 activeFeedPlayer 已经指向新集了，落盘才是自洽的记录。
+            persistFeedProgress();
             preloadAround(pos);
             prewarmNeighbor(pos);
             return;
@@ -1595,6 +1613,8 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                         session.rememberUrl(target, url);
                         if (target == curPos) {
                             playPage(target, url);
+                            // 同上：等 activeFeedPlayer 指向新集再落盘。
+                            persistFeedProgress();
                             preloadAround(target);
                         }
                         prewarmNeighbor(curPos);
@@ -1882,6 +1902,10 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         // 表现就是「退出播放器了声音还在放」。
         releaseOne(playerA);
         releaseOne(playerB);
+        // 兜底再清一次：releaseOne 已逐条 remove，这里 clear 保证不留任何旧
+        // player 的钉子 —— 不然 onNewIntent 换集后 attachVout 的幂等判断
+        // 拿旧条目认错 view，新画面挂不到正确的 TextureView 上。
+        attachedTo.clear();
         playerA = null;
         playerB = null;
         pageA = pageB = -1;
@@ -1897,6 +1921,10 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         try { mp.setEventListener(null); } catch (Throwable ignored) {}
         try { mp.stop(); } catch (Throwable ignored) {}
         try { mp.getVLCVout().detachViews(); } catch (Throwable ignored) {}
+        // attachedTo 里这条也得跟着清：player 释放后 map 还钉着它，下次同槽位
+        // 复用时 attachVout 的幂等判断（attachedTo.get(mp) == pv.texture）会对着
+        // 已释放的对象认错 view。
+        attachedTo.remove(mp);
         try { mp.release(); } catch (Throwable ignored) {}
     }
 
@@ -1925,6 +1953,11 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         final int type = event.type;
         if (type == MediaPlayer.Event.LengthChanged) {
             durationMs = mp.getLength();
+            // demuxer 就绪了，把 playPage 欠下的续播点补上；这时 setTime 才不会丢。
+            if (pendingResume > 2000) {
+                try { mp.setTime(pendingResume); } catch (Throwable ignored) {}
+            }
+            pendingResume = 0;
         } else if (type == MediaPlayer.Event.TimeChanged) {
             long time = mp.getTime();
             if (durationMs <= 0) durationMs = mp.getLength();

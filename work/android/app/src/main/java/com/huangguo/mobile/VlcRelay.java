@@ -467,7 +467,9 @@ final class VlcRelay {
                 StringBuilder head = new StringBuilder(160);
                 head.append("HTTP/1.1 200 OK\r\n");
                 head.append("Content-Type: ").append(type).append("\r\n");
-                head.append("Content-Length: ").append(rewritten.length()).append("\r\n");
+                // Content-Length 必须按 UTF-8 字节数给，下面 body 就是按字节写的；
+                // 用 length()（字符数）遇到非 ASCII 会对不上，客户端按头截断。
+                head.append("Content-Length: ").append(rewritten.getBytes(StandardCharsets.UTF_8).length).append("\r\n");
                 head.append("Accept-Ranges: none\r\n");
                 head.append("Connection: close\r\n\r\n");
                 out.write(head.toString().getBytes(StandardCharsets.ISO_8859_1));
@@ -1142,10 +1144,9 @@ final class VlcRelay {
         append(head, "Last-Modified", response.header("Last-Modified"));
         append(head, "ETag", response.header("ETag"));
 
-        // 长度未知时必须用 chunked，否则 VLC 会一直等我们声明的 body。
-        if (response.header("Content-Length") == null && code != 204 && code != 304) {
-            head.append("Transfer-Encoding: chunked\r\n");
-        }
+        // 长度未知时也不能声明 chunked：serve() 里 body 是裸流直写、没有
+        // chunk 分帧，VLC 按严格 chunk 解析必然失败。响应已带 Connection: close，
+        // 就靠 EOF 定界。
         head.append("Connection: close\r\n\r\n");
 
         out.write(head.toString().getBytes(StandardCharsets.ISO_8859_1));

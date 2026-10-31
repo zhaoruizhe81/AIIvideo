@@ -391,21 +391,6 @@ final class SpiderRuntime {
             Log.i(TAG, "本次调用带过盾回填：" + cannedPages.length() + " 页，共 "
                     + describeCanned(cannedPages));
         }
-        final Session s = new Session(cap, spiderSource,
-                sanitizeArgs(args), budget, gen, cannedPages);
-        // 当前生效的源配置。取不到就留 null，net 退回全局路由（见 Session.profile）。
-        s.ctx = app.getApplicationContext();
-        // profile 是 net 走哪条路由的唯一依据。取不到就别硬撑 —— 那就退回老的
-        // 全局路由（不带 NetRoute），并在日志里说清楚，否则「App 能取、spider 不能」
-        // 这种问题会被误判成站点抽风。
-        try {
-            s.profile = SiteProfile.current(s.ctx);
-        } catch (Throwable e) {
-            UserSource.log("spider 拿不到当前源配置：" + e);
-        }
-        // 不兜底构造：currentSite() 是「当前生效配置」的唯一入口，它给了 null 说明
-        // 配置本身有问题，那时候再拼一份出来只会掩盖真正的错。日志里说清楚就够。
-
         // 只作废「还在排队」的，不动「正在跑」的那一次。
         //
         // 试过连正在跑的也杀掉（省掉它剩下的那一两秒），但 session 字段是在拿到锁
@@ -418,15 +403,35 @@ final class SpiderRuntime {
 
         // 排队也算在预算里：等锁等掉的钱不该再从看门狗里另算一份，
         // 否则用户点一下要等 30 秒才看到「超时」。
+        final long lockBeganAt = System.currentTimeMillis();
         if (!CALL_LOCK.tryAcquire(budget, TimeUnit.MILLISECONDS)) {
             throw new IOException("spider 排队超时（另一个调用还占着宿主）。");
         }
+        Session s = null;
         try {
             // 拿到锁的第一件事：还是不是最新那次？不是就立刻让出去 ——
             // 抢在 startPage 之前判断，省掉的正是用户最不耐烦的那一两秒。
             if (gen != GENERATION.get()) {
                 throw new IOException("被更新的请求取代");
             }
+            // 等锁实际耗掉的时间从预算里扣掉（保底 1 秒），看门狗和 await 用的
+            // 都是这份已扣减的值 —— Session 挪到拿到锁之后才建就是为此。
+            // 不然「排队满预算 + 再跑满预算」最坏等 2×timeout，和上面承诺相反。
+            final long waitedMs = System.currentTimeMillis() - lockBeganAt;
+            s = new Session(cap, spiderSource,
+                    sanitizeArgs(args), Math.max(1_000L, budget - waitedMs), gen, cannedPages);
+            // 当前生效的源配置。取不到就留 null，net 退回全局路由（见 Session.profile）。
+            s.ctx = app.getApplicationContext();
+            // profile 是 net 走哪条路由的唯一依据。取不到就别硬撑 —— 那就退回老的
+            // 全局路由（不带 NetRoute），并在日志里说清楚，否则「App 能取、spider 不能」
+            // 这种问题会被误判成站点抽风。
+            try {
+                s.profile = SiteProfile.current(s.ctx);
+            } catch (Throwable e) {
+                UserSource.log("spider 拿不到当前源配置：" + e);
+            }
+            // 不兜底构造：currentSite() 是「当前生效配置」的唯一入口，它给了 null 说明
+            // 配置本身有问题，那时候再拼一份出来只会掩盖真正的错。日志里说清楚就够。
             session = s;
             startPage(app, s);
             if (!s.done.await(s.timeoutMs + AWAIT_GRACE_MS, TimeUnit.MILLISECONDS)) {
@@ -441,8 +446,11 @@ final class SpiderRuntime {
             }
             return s.result == null ? new JSONObject() : s.result;
         } finally {
-            if (session == s) session = null;
-            releasePage(s);
+            // s 可能为 null：世代检查没过时根本没建 Session。
+            if (s != null) {
+                if (session == s) session = null;
+                releasePage(s);
+            }
             CALL_LOCK.release();
         }
     }
@@ -550,6 +558,14 @@ final class SpiderRuntime {
 
         Map<String, String> headers = headersOf(args);
         String method = args.optString("method", "GET").trim().toUpperCase(Locale.ROOT);
+        // method 白名单：认不出来的值当场抛（和下面 parseFormat「认不出就抛」同一个
+        // 约定），不能静默落成 form POST —— 源写错 method 时那是对另一个接口发的
+        // 请求，对面回「参数缺失」，从响应上根本查不到这里。
+        final boolean headMethod = "HEAD".equals(method);   // HEAD 按 GET 路径发：拿头不要体
+        if (!"GET".equals(method) && !"POST".equals(method) && !headMethod) {
+            throw new IllegalArgumentException(
+                    "net 拒绝：不认识的 method：" + method + "（只认 GET / POST / HEAD）");
+        }
         String body = args.isNull("body") ? null : args.optString("body", "");
         // 老站里有一批 GBK/Big5 的（返回头还常常不带 charset，或者带成 ISO-8859-1），
         // 一律按 UTF-8 解就是整页乱码，而且 spider 侧没有补救手段。所以把解码字符集
@@ -569,7 +585,7 @@ final class SpiderRuntime {
         try {
             java.nio.charset.Charset charset = charsetOf(args.optString("charset", ""));
             byte[] raw;
-            if ("GET".equals(method)) {
+            if ("GET".equals(method) || headMethod) {
                 SiteProfile prof = s.profile;
                 // 只打一次。
                 //
@@ -797,6 +813,10 @@ final class SpiderRuntime {
                 // 单项超时给得比 net 自己宽 5 秒：先让 net 自己报超时，它那句更具体。
                 results.put(futures.get(i).get(NET_TIMEOUT_S + 5L, TimeUnit.SECONDS));
             } catch (Throwable e) {
+                // 等不到（或等待被打断）就把任务取消掉：池子一共 8 条线程，
+                // 只放弃等待不 cancel 的话，僵尸任务会把池占满，拖死后续整批请求。
+                // 已完成的 future cancel 是无害空操作。
+                futures.get(i).cancel(true);
                 try {
                     results.put(new JSONObject().put("ok", false).put("error", "netAll 单项超时"));
                 } catch (Throwable ignored) {
@@ -1043,11 +1063,16 @@ final class SpiderRuntime {
      * 没加载成功（或版本不对没有这个函数），抛的是 ReferenceError —— 同步异常 Promise
      * 的 rejection 接不住，不接就成了「没人调 done」，用户看到 15 秒超时而不是
      * 「宿主页没起来」。多包一层，错误立刻变成一句可读的话。
+     *
+     * <p><b>then 链尾必须跟 .catch</b>（和上面同一个理由的另一半）：cap 函数异步
+     * 抛出的异常同步 try 接不到，不接就没人调 done —— 错误被掩盖成 15 秒超时，
+     * 看门狗还把页面销毁了。
      */
     private static String driverJs(Session s) {
         return "(function(){try{"
                 + "__spiderRun(" + JSONObject.quote(s.cap) + "," + JSONObject.quote(s.argsJson) + ")"
-                + ".then(function(r){__spider.call('done', r)});"
+                + ".then(function(r){__spider.call('done', r)})"
+                + ".catch(function(e){__spider.call('done',{ok:false,error:String((e&&e.message)||e)})});"
                 + "}catch(e){__spider.call('done',{ok:false,error:String((e&&e.message)||e)});}})()";
     }
 

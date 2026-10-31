@@ -237,9 +237,23 @@ final class SpiderClient {
                 // 它只在 ensure 的等待窗口里被消费，断连时那个窗口早已结束。
                 disconnected = true;
                 channel = null;
+                // 光清 channel 不够：bindAttempted/connection 不复位的话，bind() 会
+                // 直接 return（bound 闩锁还是放开的旧值），重连窗口内所有调用立刻
+                // 报「绑定失败」。解绑旧注册 + 复位，下一次 call() 才会真正重走
+                // bind()（那边会 new 闩锁和新 connection）。unbindService 不碰
+                // SpiderClient.class 锁，和后台线程的 bind() 互不了卡。
+                if (connection != null && appContext != null) {
+                    try {
+                        appContext.unbindService(connection);
+                    } catch (Throwable ignored) {
+                    }
+                }
+                connection = null;
                 // 这条路径比 shutdown() 重要得多：它才是「宿主自己死了」的那种死法，
                 // 而进程内的 onDestroy 在这种情况下一个字都写不出来。
+                // host_stop 依赖 bindAttempted（见 reportHostStop），先报再清。
                 reportHostStop("disconnected");
+                bindAttempted = false;
             }
 
             @Override
@@ -249,6 +263,15 @@ final class SpiderClient {
                 disconnected = true;
                 bindingDied = true;
                 channel = null;
+                // 旧注册不解掉会一直泄漏（反复死亡重绑时每轮漏一个 binder）；
+                // 解绑 + 复位，让下一次 call() 真正重走 bind()。
+                if (connection != null && appContext != null) {
+                    try {
+                        appContext.unbindService(connection);
+                    } catch (Throwable ignored) {
+                    }
+                }
+                connection = null;
                 bindAttempted = false;
             }
         };

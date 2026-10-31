@@ -424,13 +424,18 @@ final class ProxyConsole {
 
         proxyStore(context).edit().putString(SUB_URL_KEY, target).apply();
         lastSubUrl = target;
-        // 刚拉到的这份顺手放进缓存：紧接着的「测速」就不用再下载一次了。
-        // 机场订阅 TTFB 实测能到 10 秒，点一次「拉取并测速」拉两遍就是 20 秒。
-        cachedSubUrl = target;
-        cachedSubAt = System.currentTimeMillis();
-        cachedSub = parsed;
-        // 换了订阅，旧的测速结果整套作废 —— 下标对不上了，留着只会让 use 用错节点。
-        lastSpeedTest = null;
+        // 缓存写入 + 旧测速结果作废，必须和 proxySpeed 的回写同锁（SPEED_LOCK）：
+        // 不持锁的话「置空」可能插在测速线程「累计 → 回写 lastSpeedTest」中间，
+        // 上一份订阅的结果被原样发布，use?index=N 就连到别的机场节点上了。
+        synchronized (SPEED_LOCK) {
+            // 刚拉到的这份顺手放进缓存：紧接着的「测速」就不用再下载一次了。
+            // 机场订阅 TTFB 实测能到 10 秒，点一次「拉取并测速」拉两遍就是 20 秒。
+            cachedSubUrl = target;
+            cachedSubAt = System.currentTimeMillis();
+            cachedSub = parsed;
+            // 换了订阅，旧的测速结果整套作废 —— 下标对不上了，留着只会让 use 用错节点。
+            lastSpeedTest = null;
+        }
 
         UserSource.log("订阅 " + target.substring(0, Math.min(50, target.length()))
                 + " → " + Subscription.summary(parsed));

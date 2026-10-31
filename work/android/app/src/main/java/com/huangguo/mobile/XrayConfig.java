@@ -90,6 +90,12 @@ final class XrayConfig {
         String path = "/";
         /** ws / h2 的 Host 头；TLS 缺 SNI 时也拿它。 */
         String host;
+        /**
+         * TLS / reality 的 SNI。分享链接里的 {@code sni=} 落这里，不再覆写
+         * host —— ws 场景 host 是给 CDN 的 Host 头，被 SNI 顶掉之后出站
+         * 请求全部发错站点。生成配置时 serverName 取 sni，缺省回落 host。
+         */
+        String sni;
         /** 指纹：chrome / firefox / safari / randomized … */
         String fingerprint;
         /**
@@ -421,6 +427,17 @@ final class XrayConfig {
     // ── 传输层 ────────────────────────────────────────────────────────
 
     /**
+     * TLS / reality / hy2 的 serverName：sni 优先，其次 Host 头，最后服务器地址。
+     *
+     * <p>sni 与 host 分家之后（见 {@link Node#sni}），这里必须显式优先 sni ——
+     * 否则「SNI 走 CDN、Host 走源站」的节点会拿 Host 去过 TLS 校验，必然失败。
+     */
+    private static String serverNameOf(Node node) {
+        if (!empty(node.sni)) return node.sni;
+        return empty(node.host) ? node.server : node.host;
+    }
+
+    /**
      * streamSettings。tcp + 无 TLS 时返回 null —— 那是 Xray 的默认值，
      * 写出来只是让配置变长、让测试断言多一层噪音。
      */
@@ -438,7 +455,7 @@ final class XrayConfig {
                     .put("network", "hysteria2")
                     .put("security", "tls");
             JSONObject tls = new JSONObject()
-                    .put("serverName", empty(node.host) ? node.server : node.host);
+                    .put("serverName", serverNameOf(node));
             if (node.allowInsecure) tls.put("allowInsecure", true);
             hyStream.put("tlsSettings", tls);
             JSONObject hy = new JSONObject().put("password", empty(node.uuid) ? "" : node.uuid);
@@ -464,7 +481,7 @@ final class XrayConfig {
             JSONObject tls = new JSONObject();
             // SNI 缺省用 Host 头。ws + tls 的机场几乎总是同域，两处分开的只有
             // 「SNI 走 CDN、Host 走源站」的少数场景。
-            tls.put("serverName", empty(node.host) ? node.server : node.host);
+            tls.put("serverName", serverNameOf(node));
             if (!empty(node.fingerprint)) tls.put("fingerprint", node.fingerprint);
             if (node.allowInsecure) tls.put("allowInsecure", true);
             stream.put("tlsSettings", tls);
@@ -472,7 +489,7 @@ final class XrayConfig {
             // libgojni.so 里 reality 只有 1 处字符串命中，八成是残缺实现。
             // 字段照摆，但不做任何「能用」的承诺。
             JSONObject reality = new JSONObject()
-                    .put("serverName", empty(node.host) ? node.server : node.host)
+                    .put("serverName", serverNameOf(node))
                     .put("publicKey", empty(node.publicKey) ? "" : node.publicKey)
                     .put("shortId", empty(node.shortId) ? "" : node.shortId);
             if (!empty(node.fingerprint)) reality.put("fingerprint", node.fingerprint);
@@ -822,7 +839,7 @@ final class XrayConfig {
      *   type            传输层 tcp/ws/grpc/h2
      *   security        tls/none/reality（trojan 缺省按 tls）
      *   path / host     ws、h2 用；host 同时兼作 SNI 缺省
-     *   sni             TLS 的 serverName，覆盖 host
+     *   sni             TLS 的 serverName，落 sni 字段（生成时优先于 host）
      *   fp              指纹
      *   pbk / sid       reality 的公钥与 shortId
      *   flow            vless 流控（xtls-rprx-vision 之类）
@@ -865,7 +882,13 @@ final class XrayConfig {
         if (!empty(host)) node.host = host;
 
         String sni = q.get("sni");
-        if (!empty(sni)) node.host = sni;
+        if (!empty(sni)) {
+            // 只落 sni 字段；host 已有值时绝不覆写 —— 那是 ws/h2 的 Host 头，
+            // 被 SNI 顶掉之后出站请求全发错站。host 为空才用 sni 补缺省，
+            // 让 sni-only 的链接维持原行为（serverName 与 Host 头不变）。
+            node.sni = sni;
+            if (empty(node.host)) node.host = sni;
+        }
 
         String fp = q.get("fp");
         if (!empty(fp)) node.fingerprint = fp;
@@ -946,6 +969,9 @@ final class XrayConfig {
         node.tls = raw.optString("tls", "none");
         node.path = raw.optString("path", "/");
         node.host = raw.optString("host", "");
+        // Clash 转出来的 vmess JSON 带 sni 键（见 Subscription.vlessOrVmessLink），
+        // 不读的话 SNI 就丢了，TLS 只能拿 host 去握手。
+        node.sni = raw.optString("sni", "");
         // vmess 链接里 grpc 的 serviceName 就写在 path 字段上。
         node.serviceName = node.path;
         return node;
@@ -955,18 +981,21 @@ final class XrayConfig {
         // 两种写法：
         //   base64(method:password)@host:port#备注
         //   base64(method:password@host:port)#备注
+        // 序列化侧（Subscription.addClashLink）会把密码 percent-encode，这里
+        // 解出来之后要同步解开 —— 否则带 @ 的密码在 Node 上永远是 %40 的样子，
+        // 对端认证必失败。
         String text = body;
         int hash = text.indexOf('#');
         if (hash > 0) text = text.substring(0, hash);
 
         int at = text.lastIndexOf('@');
         if (at > 0) {
-            return ssNode(decodeText(text.substring(0, at)), text.substring(at + 1));
+            return ssNode(percentDecode(decodeText(text.substring(0, at))), text.substring(at + 1));
         }
         String decoded = decodeText(text);
         int at2 = decoded.lastIndexOf('@');
         if (at2 <= 0) throw new IllegalArgumentException("ss 链接看不懂");
-        return ssNode(decoded.substring(0, at2), decoded.substring(at2 + 1));
+        return ssNode(percentDecode(decoded.substring(0, at2)), decoded.substring(at2 + 1));
     }
 
     private static Node ssNode(String userInfo, String hostPort) {

@@ -224,6 +224,7 @@ public final class MediaProxy {
      * 要么整集从头读，要么直接判「不支持」。
      */
     public static WebResourceResponse fetch(WebResourceRequest request) {
+        Response response = null;
         try {
             String url = request.getUrl().toString();
             Request.Builder builder = new Request.Builder().url(url).get();
@@ -234,7 +235,7 @@ public final class MediaProxy {
             // 媒体栈要求原样字节（identity;q=1, *;q=0），转过去。
             builder.header("Accept-Encoding", "identity");
 
-            Response response = client().newCall(builder.build()).execute();
+            response = client().newCall(builder.build()).execute();
             ResponseBody body = response.body();
             if (body == null) {
                 response.close();
@@ -261,6 +262,12 @@ public final class MediaProxy {
             // OkHttp 那边跟着释放连接。
             return out;
         } catch (Throwable e) {
+            // execute() 成功后、构造/返回段抛上来的异常也落在这儿：response 已
+            // 占着连接池一条连接，必须在这儿关掉，否则越积越多。正常返回的流
+            // 要活到 WebView 读完，所以只有这个异常分支允许 close。
+            if (response != null) {
+                try { response.close(); } catch (Throwable ignored) {}
+            }
             log("媒体代理失败，回落到 WebView：" + e.getClass().getSimpleName() + " " + e.getMessage());
             return null;
         }

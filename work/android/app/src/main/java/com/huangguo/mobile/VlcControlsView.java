@@ -387,7 +387,12 @@ final class VlcControlsView {
         if (hintView != null) hintView.setVisibility(View.GONE);
     }
 
-    void hideHintSoon() { hideHint(); }
+    /** 与 Activity 侧 hideHintSoon 语义一致：延迟 700ms 再收，立即隐藏会闪一下。 */
+    void hideHintSoon() {
+        // 这层不是 View，没有自己的 postDelayed —— 学 buildLockButton 里那条路，
+        // 现起一个主线程 Handler 走 hideHintAfter（自带 removeCallbacks 去重）。
+        hideHintAfter(700, new android.os.Handler(android.os.Looper.getMainLooper()));
+    }
 
     /** 延后收提示。宿主那边有自己的 Handler，这里只管取消自己那条。 */
     void hideHintAfter(long delayMs, android.os.Handler ui) {

@@ -59,14 +59,17 @@ final class SpeedTest {
     /** 日志里只留「协议 + 主机:端口」，不要把 uuid/密码写进 logcat。 */
     static String shortLink(String link) {
         if (link == null) return "";
-        String head = link.length() > 32 ? link.substring(0, 32) : link;
         try {
-            int at = head.indexOf('@');
-            if (at > 0) head = head.substring(at + 1);
+            // @ 要在整个链接上找：vless 的 uuid 就有 36 个字符，先按长度截断
+            // 会把凭据的前半段留在日志里。命中从 @ 后面取，再统一限长。
+            int at = link.indexOf('@');
+            String head = at > 0 ? link.substring(at + 1) : link;
+            if (head.length() > 48) head = head.substring(0, 48);
             int hash = head.indexOf('#');
             if (hash > 0) head = head.substring(0, hash);
+            return head;
         } catch (Throwable ignored) {}
-        return head;
+        return "";
     }
 
     /** 一条测速结果。 */
