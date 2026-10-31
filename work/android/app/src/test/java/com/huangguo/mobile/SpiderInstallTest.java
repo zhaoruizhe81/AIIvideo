@@ -98,4 +98,57 @@ public class SpiderInstallTest {
         assertTrue(SpiderStore.removeFrom(dir, "demo"));
         assertFalse(new File(dir, "demo.js").isFile());
     }
+
+    /**
+     * requires 写成数字（读不出字符串字面量）：门禁自己声明「认不出来的一律
+     * 拒绝」，当没写放行的话老壳会静默跑上一个要求新 ABI 的源。
+     */
+    @Test public void requires写成数字被拒() throws Exception {
+        File dir = tmp.newFolder("spiders");
+        byte[] raw = ("__spiderSite = { id: 'demo', name: '测试源', version: 1, requires: 2,"
+                + " hosts: [], async home(ctx) { return { items: [] }; } };")
+                .getBytes(StandardCharsets.UTF_8);
+        try {
+            SpiderStore.installTo(dir, "https://example.com/x.js", raw);
+            throw new AssertionError("数字 requires 应该被拒");
+        } catch (Exception expected) {
+            assertEquals("被拒的源不该落盘", 0, dir.listFiles().length);
+        }
+    }
+
+    /**
+     * 跨进程读回（Binder 上只传「路径 + 大小 + 修改时间」）：指纹对得上才能读；
+     * 对不上说明主进程门禁扫描之后文件被换过（重新装/删），那一版没过过门禁，
+     * 拒绝执行；路径跑出源目录、文件不存在，同样拒。
+     */
+    @Test public void 按路径指纹读回源文件() throws Exception {
+        File dir = tmp.newFolder("spiders");
+        SpiderStore.installTo(dir, "https://example.com/x.js", src("demo", null));
+        File f = new File(dir, "demo.js");
+        String text = SpiderStore.readFromSourceDir(dir, f.getAbsolutePath(),
+                f.length(), f.lastModified());
+        assertTrue("读回来的应该是源码本身", text.contains("__spiderSite"));
+
+        try {
+            SpiderStore.readFromSourceDir(dir, f.getAbsolutePath(),
+                    f.length() + 1, f.lastModified());
+            throw new AssertionError("大小对不上应该被拒");
+        } catch (Exception expected) {
+            // ok
+        }
+        try {
+            File outside = tmp.newFile("evil.js");
+            SpiderStore.readFromSourceDir(dir, outside.getAbsolutePath(),
+                    outside.length(), outside.lastModified());
+            throw new AssertionError("源目录外的路径应该被拒");
+        } catch (Exception expected) {
+            // ok
+        }
+        try {
+            SpiderStore.readFromSourceDir(dir, new File(dir, "nope.js").getAbsolutePath(), 1, 1);
+            throw new AssertionError("不存在的文件应该被拒");
+        } catch (Exception expected) {
+            // ok
+        }
+    }
 }

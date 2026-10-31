@@ -19,6 +19,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -99,6 +100,10 @@ final class ReportQueue {
     /** 落盘一条。失败就算了 —— 上报坏掉不该影响任何用户路径。 */
     void enqueue(JSONObject event) {
         if (this.backlog >= MAX_BACKLOG) {
+            // 满 600 就开始丢事件，这件事必须留痕：丢了多少、从什么时候开始丢的，
+            // 只能靠这里。静默 return 的话队列卡死在 600 上谁也发现不了。
+            Log.w(TAG, "队列已满（" + MAX_BACKLOG + "），丢掉一条："
+                    + event.optString("kind") + "/" + event.optString("name"));
             return;
         }
         byte[] line = (event.toString() + "\n").getBytes(StandardCharsets.UTF_8);
@@ -417,7 +422,42 @@ final class ReportQueue {
         return rest;
     }
 
-    /** 把剩下的行写回原文件（先写 .tmp 再改名）。失败就保持 .sending 等下次。 */
+    /**
+     * 两份事件行合并去重，first 在前（较旧）。有 id 按 id 认身份；没有 id 的退回按整行。
+     *
+     * 用在「.sending 改名回去之前，目标 .jsonl 已被发送窗口内的新事件重建」的场合：
+     * 两份都必须保住，又不能把同一条事件存两遍。这里按 id 而不是按对象身份 ——
+     * {@link #remaining} 合并的是内存里同一批对象，这里合并的是**两份磁盘文件**，
+     * 同一条事件在两边是不同的对象实例，只有 id 是靠得住的身份。
+     */
+    static List<JSONObject> mergeEvents(List<JSONObject> first, List<JSONObject> second) {
+        LinkedHashMap<String, JSONObject> merged = new LinkedHashMap<String, JSONObject>();
+        for (JSONObject event : first) {
+            merged.put(eventKeyOf(event), event);
+        }
+        for (JSONObject event : second) {
+            if (!merged.containsKey(eventKeyOf(event))) {
+                merged.put(eventKeyOf(event), event);
+            }
+        }
+        return new ArrayList<JSONObject>(merged.values());
+    }
+
+    /** 事件去重键：有 id 用 id；没有的退回整行（前缀 # 防止和真 id 撞）。 */
+    private static String eventKeyOf(JSONObject event) {
+        String id = event.optString("id");
+        return id.length() > 0 ? id : "#" + event.toString();
+    }
+
+    /**
+     * 把剩下的行写回原文件（先写 .tmp 再改名）。失败就保持 .sending 等下次。
+     *
+     * 两个坑，都是发送窗口（claim 之后、写回之前）造成的：
+     * · 窗口内 enqueue 会把同名 .jsonl 重建出来（新事件直接写进它），直接改名
+     *   会把它整块盖掉 —— 先读出来按事件 id 合并再落盘。
+     * · 改名成功后必须删掉 .sending：它的内容已经由写回的 .jsonl 代表，留着的话
+     *   下次启动 recoverSending 会把已发过的旧内容整份复活（重复发送）。
+     */
     private boolean rewrite(File sendingFile, List<JSONObject> rest) {
         if (rest.isEmpty()) {
             return sendingFile.delete();
@@ -425,9 +465,15 @@ final class ReportQueue {
         File tmp = new File(this.dir, sendingFile.getName() + ".tmp");
         java.io.BufferedWriter writer = null;
         try {
+            String name = sendingFile.getName();
+            File target = new File(this.dir, name.substring(0, name.length() - SENDING.length()));
+            List<JSONObject> merged = rest;
+            if (target.isFile()) {
+                merged = mergeEvents(rest, readLines(target));
+            }
             writer = new java.io.BufferedWriter(new java.io.OutputStreamWriter(
                     new FileOutputStream(tmp), StandardCharsets.UTF_8));
-            for (JSONObject event : rest) {
+            for (JSONObject event : merged) {
                 writer.write(event.toString());
                 writer.write('\n');
             }
@@ -435,9 +481,10 @@ final class ReportQueue {
             writer.close();
             writer = null;
             // tmp → 正常的队列文件名（去掉 .sending）
-            String name = sendingFile.getName();
-            File target = new File(this.dir, name.substring(0, name.length() - SENDING.length()));
             if (tmp.renameTo(target)) {
+                if (!sendingFile.delete()) {
+                    Log.w(TAG, "删不掉已写回的 " + name + "，下次启动可能重发旧内容");
+                }
                 return true;
             }
             Log.w(TAG, "写回改名失败 " + name);
@@ -532,9 +579,49 @@ final class ReportQueue {
             return;
         }
         File target = new File(this.dir, name.substring(0, name.length() - SENDING.length()));
+        if (target.isFile()) {
+            // 发送窗口内 enqueue 重建了同名 .jsonl：直接改名会把新事件盖掉，
+            // 先按事件 id 合并再原子替换。合并失败就把 .sending 留在盘上 ——
+            // 下次启动 recoverSending 还能再来一遍，宁可滞留不能覆盖。
+            if (mergeSendingBack(file, target)) {
+                return;
+            }
+            Log.w(TAG, "写回合并失败 " + name + "，留在盘上等下次启动恢复");
+            return;
+        }
         if (!file.renameTo(target)) {
             Log.w(TAG, "改名失败 " + name);
         }
+    }
+
+    /** 把 .sending 的内容并进目标 .jsonl（原子替换）；成功返回 true，.sending 一并删掉。 */
+    private boolean mergeSendingBack(File sendingFile, File target) {
+        File tmp = new File(this.dir, sendingFile.getName() + ".tmp");
+        try {
+            List<JSONObject> merged = mergeEvents(readLines(sendingFile), readLines(target));
+            java.io.BufferedWriter writer = new java.io.BufferedWriter(new java.io.OutputStreamWriter(
+                    new FileOutputStream(tmp), StandardCharsets.UTF_8));
+            try {
+                for (JSONObject event : merged) {
+                    writer.write(event.toString());
+                    writer.write('\n');
+                }
+            } finally {
+                writer.close();
+            }
+            if (!tmp.renameTo(target)) {
+                tmp.delete();
+                return false;
+            }
+        } catch (IOException error) {
+            Log.w(TAG, "合并写回失败：" + error.getMessage());
+            tmp.delete();
+            return false;
+        }
+        if (!sendingFile.delete()) {
+            Log.w(TAG, "删不掉已合并的 " + sendingFile.getName() + "，下次启动可能重发旧内容");
+        }
+        return true;
     }
 
     /**

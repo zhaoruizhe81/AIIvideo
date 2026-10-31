@@ -112,4 +112,48 @@ public class ReportQueueTest {
         assertEquals(1, rest.size());
         assertTrue(rest.get(0) == bad);
     }
+
+    @Test
+    public void 写回合并两边都保住同id只留一份() {
+        // rewrite/release 改名回去之前，目标 .jsonl 可能已被发送窗口内的新事件
+        // 重建（claim 之后 enqueue 直接写进同名文件）。合并后两边都必须在；
+        // 崩溃残留让同一事件出现在两边时，按 id 只留一份。
+        JSONObject b = event("b");
+        JSONObject fresh = event("fresh");
+
+        List<JSONObject> merged = ReportQueue.mergeEvents(Arrays.asList(b), Arrays.asList(b, fresh));
+
+        assertEquals(2, merged.size());
+        assertEquals("b", merged.get(0).optString("name"));
+        assertEquals("fresh", merged.get(1).optString("name"));
+    }
+
+    @Test
+    public void 内容相同但id不同的两条合并后都保住() {
+        // 和 remaining() 那条「重试刷出孪生事件」同一族：身份看 id 不看内容。
+        try {
+            JSONObject one = new JSONObject().put("id", "one").put("name", "same");
+            JSONObject two = new JSONObject().put("id", "two").put("name", "same");
+
+            List<JSONObject> merged = ReportQueue.mergeEvents(Arrays.asList(one), Arrays.asList(two));
+
+            assertEquals(2, merged.size());
+        } catch (Exception error) {
+            throw new AssertionError(error);
+        }
+    }
+
+    @Test
+    public void 没有id的事件按整行去重() {
+        try {
+            JSONObject bare = new JSONObject().put("kind", "app").put("name", "x");
+            JSONObject twin = new JSONObject().put("kind", "app").put("name", "x");
+
+            List<JSONObject> merged = ReportQueue.mergeEvents(Arrays.asList(bare), Arrays.asList(twin));
+
+            assertEquals(1, merged.size());
+        } catch (Exception error) {
+            throw new AssertionError(error);
+        }
+    }
 }

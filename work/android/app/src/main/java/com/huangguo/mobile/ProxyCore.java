@@ -201,7 +201,7 @@ public final class ProxyCore {
             // 等到端口真的能连上再返回，代价是几百毫秒，比让用户「重启一下」便宜。
             boolean listening = awaitListening(chosen, 2500);
             log("已启动 " + node.describe() + " → socks5://127.0.0.1:" + chosen
-                    + (listening ? "" : "（2.5 秒内没等到入站，先放行）"));
+                    + (listening ? "" : "（2.5 秒内没等到两个入站，先放行）"));
             return true;
         } catch (Throwable e) {
             // 只把 controller 置空是**不够的**：CoreController 在 native 那边登记了一个
@@ -223,30 +223,39 @@ public final class ProxyCore {
 
 
     /**
-     * 等本地 SOCKS 入站真的能连上。
+     * 等本地入站真的能连上。
      *
      * <p>判据只能是「连得上」：端口被占、核心半死、goroutine 还没跑到监听点，
      * 这三种在 Java 侧看不到区别，只有 connect 能证伪。
      *
-     * @return 超时前连上返回 true
+     * <p>配置里起了两个相邻入站（SOCKS 在 port、HTTP 在 port+1，见
+     * XrayConfig.build），两个都要探：只探 SOCKS 的话，HTTP 那个被抢或没起来，
+     * WebView 会拿到一个连不上的代理地址还无人察觉。
+     *
+     * @return 超时前两个都连上返回 true
      */
     private static boolean awaitListening(int port, long timeoutMs) {
         long began = System.currentTimeMillis();
         while (System.currentTimeMillis() - began < timeoutMs) {
-            java.net.Socket probe = new java.net.Socket();
-            try {
-                probe.connect(new java.net.InetSocketAddress("127.0.0.1", port), 150);
-                return true;
-            } catch (Throwable ignored) {
+            boolean allUp = true;
+            for (int p : new int[] {port, port + 1}) {
+                java.net.Socket probe = new java.net.Socket();
                 try {
-                    Thread.sleep(60);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return false;
+                    probe.connect(new java.net.InetSocketAddress("127.0.0.1", p), 150);
+                } catch (Throwable ignored) {
+                    allUp = false;
+                    try {
+                        Thread.sleep(60);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                    break;
+                } finally {
+                    try { probe.close(); } catch (Throwable ignored) {}
                 }
-            } finally {
-                try { probe.close(); } catch (Throwable ignored) {}
             }
+            if (allUp) return true;
         }
         return false;
     }
@@ -462,20 +471,24 @@ public final class ProxyCore {
      * 系统给短命连接的临时口范围，更容易撞上 TIME_WAIT。
      *
      * 系统分配只试一次：它给的结果对区间没有任何倾向性，多试几次不如直接抽签。
+     *
+     * 「空闲」必须**成对**：配置要起两个相邻入站（SOCKS 在 port、HTTP 在
+     * port+1，见 XrayConfig.build），只探一个的话 +1 被别的进程占走，核心这边
+     * SOCKS 正常、WebView 的 HTTP 入站悄悄起不来，还没有任何报错。
      */
     static int pickPort(int min, int max) throws IOException {
         if (min <= 0 || max > 65535 || min >= max) {
             throw new IllegalArgumentException("端口区间不合法：" + min + "-" + max);
         }
         int free = freePort();
-        if (free >= min && free <= max) return free;
+        if (free >= min && free <= max && probe(free + 1)) return free;
 
         Random random = new Random();
         for (int i = 0; i < PROBE_ATTEMPTS; i++) {
             int candidate = min + random.nextInt(max - min);
-            if (probe(candidate)) return candidate;
+            if (probe(candidate) && probe(candidate + 1)) return candidate;
         }
-        throw new IOException("区间 " + min + "-" + max + " 内没有空闲端口");
+        throw new IOException("区间 " + min + "-" + max + " 内没有成对的空闲端口");
     }
 
     /** 系统分配的空闲端口，0 表示拿不到。 */

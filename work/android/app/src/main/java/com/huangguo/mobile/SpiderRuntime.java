@@ -349,6 +349,30 @@ final class SpiderRuntime {
         return sb.toString();
     }
 
+    /** 回填表的单页上限（字符数）。与 SpiderClient 的请求侧同值：进会话前最后一道闸。 */
+    private static final int MAX_CANNED_PAGE_CHARS = 512 * 1024;
+
+    /** 把超限的页从回填表里剔掉，返回一张新表；原表不动。 */
+    private static JSONObject filterCannedPages(JSONObject pages) {
+        final JSONObject out = new JSONObject();
+        final Iterator<String> it = pages.keys();
+        while (it.hasNext()) {
+            final String url = it.next();
+            final String body = pages.optString(url, "");
+            if (body.length() > MAX_CANNED_PAGE_CHARS) {
+                Log.w(TAG, "过盾回填页太大，不缓存（" + body.length() + " > "
+                        + MAX_CANNED_PAGE_CHARS + " 字符）：" + url);
+                continue;
+            }
+            try {
+                out.put(url, body);
+            } catch (Throwable ignored) {
+                // put 只在 key 为 null 时抛，url 来自 keys() 不可能；真抛了少缓存一页而已。
+            }
+        }
+        return out;
+    }
+
 
     /**
      * 把一个 spider 源码字符串装进宿主页并调用一次能力。<b>后台线程调用。</b>
@@ -386,7 +410,13 @@ final class SpiderRuntime {
         final long gen = GENERATION.incrementAndGet();
         // 方案 1 的回填：主进程过盾成功后，把 url→html 表挂在「重试调用」的 args 上
         // 塞回来。必须在这里摘走 —— net 的 args 是 spider JS 自己拼的，看不见调用 args。
-        final JSONObject cannedPages = args == null ? null : args.optJSONObject(ARG_SHIELD_PAGES);
+        JSONObject cannedPages = args == null ? null : args.optJSONObject(ARG_SHIELD_PAGES);
+        if (cannedPages != null) {
+            // 单页超限的不缓存：Session.cannedPages 里的正文会被当成那份地址的
+            // 真实响应喂给解析器。主进程 SpiderClient 已按上限瘦身过一次，这里
+            // 再拦一道，挡住绕过 SpiderClient 直接进运行时的调用。
+            cannedPages = filterCannedPages(cannedPages);
+        }
         if (cannedPages != null && cannedPages.length() > 0) {
             Log.i(TAG, "本次调用带过盾回填：" + cannedPages.length() + " 页，共 "
                     + describeCanned(cannedPages));
@@ -781,6 +811,10 @@ final class SpiderRuntime {
         final Semaphore gate = new Semaphore(Math.min(concurrency, NETALL_MAX_CONCURRENCY));
 
         final List<Future<JSONObject>> futures = new ArrayList<Future<JSONObject>>(count);
+        // 整批里第一个撞盾的信号：netAll 结束时统一上抛，走与 net 相同的
+        // 「主进程过盾 → 回填 → 重跑」链路（见 call() 里 shieldUrl 的重建）。
+        final java.util.concurrent.atomic.AtomicReference<ShieldSignal> shieldHit =
+                new java.util.concurrent.atomic.AtomicReference<ShieldSignal>();
         for (int i = 0; i < count; i++) {
             final JSONObject one = requests.optJSONObject(i);
             futures.add(NETALL_POOL.submit(new java.util.concurrent.Callable<JSONObject>() {
@@ -790,9 +824,27 @@ final class SpiderRuntime {
                         gate.acquire();
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
+                        // 被打断 = 调用方已经放弃（netAll 等待超时 cancel）。不能无证
+                        // 放行：继续发请求是白烧流量，下面的 release 还会凭空多还
+                        // 一个许可，这一批剩余的并发上限就失真了。
+                        try {
+                            return new JSONObject().put("ok", false).put("error", "netAll 单项已取消");
+                        } catch (Throwable ignored) {
+                            return new JSONObject();
+                        }
                     }
                     try {
                         return net(s, one == null ? new JSONObject() : one);
+                    } catch (ShieldSignal e) {
+                        // 盾后站点：地址记下来，这一项照常回失败占位（别让其它项
+                        // 白跑），整批收齐后统一抛回去走主进程回填。
+                        shieldHit.compareAndSet(null, e);
+                        final String why = e.getMessage() == null ? String.valueOf(e) : e.getMessage();
+                        try {
+                            return new JSONObject().put("ok", false).put("error", why);
+                        } catch (Throwable ignored) {
+                            return new JSONObject();
+                        }
                     } catch (Throwable e) {
                         final String why = e.getMessage() == null ? String.valueOf(e) : e.getMessage();
                         try {
@@ -824,6 +876,11 @@ final class SpiderRuntime {
                 }
             }
         }
+        // 有任何一项撞了盾就整批作废：半批结果没人接得住（spider 拿到 ok:false
+        // 也补不回被挡的正文），抛回去让 call() 重建 ShieldSignal 交主进程，
+        // 回填后整次调用重跑 —— 与 net 单发撞盾时的语义一致。
+        final ShieldSignal shield = shieldHit.get();
+        if (shield != null) throw shield;
         Log.i(TAG, "cap=" + s.cap + " netAll n=" + count + " conc=" + concurrency);
         return new JSONObject().put("results", results);
     }
@@ -868,6 +925,32 @@ final class SpiderRuntime {
             @Override
             public void run() {
                 try {
+                    // 宿主页 cookie 清零。cookie 属于 CookieManager 而不是文档 ——
+                    // loadUrl 换作用域、甚至销毁重建 WebView 都清不掉它，上一个源留在
+                    // appassets origin 上的 cookie 下一个源用 document.cookie 就能读到，
+                    // 「换一个干净的文档作用域」的承诺对它不成立。只清这一个 origin：
+                    // 不能全局 setAcceptCookie(false)，过盾那个 WebView（SiteFetchWebView）
+                    // 靠的就是 cookie。
+                    try {
+                        final android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+                        final String origin = "https://appassets.androidplatform.net/";
+                        final String old = cm.getCookie(origin);
+                        if (old != null && old.length() > 0) {
+                            // getCookie 给的是「a=1; b=2」形态，逐个用 Max-Age=0 删。
+                            // spider 用 document.cookie 写的 cookie 不带 Path 属性时默认
+                            // 落在 /，这条清法覆盖得到。
+                            final String[] pairs = old.split(";");
+                            for (String pair : pairs) {
+                                final int eq = pair.indexOf('=');
+                                if (eq <= 0) continue;
+                                cm.setCookie(origin, pair.substring(0, eq).trim() + "=; Max-Age=0");
+                            }
+                            cm.flush();
+                            Log.i(TAG, "已清宿主页 cookie（" + pairs.length + " 条）");
+                        }
+                    } catch (Throwable e) {
+                        Log.w(TAG, "清宿主页 cookie 失败（忽略）：" + e);
+                    }
                     // 复用判定。见 reuseCount 的注释：正常收尾的页面留着，下一轮接着用。
                     final boolean reuse = webView != null && reuseCount < MAX_REUSE;
                     if (reuse) {
@@ -976,6 +1059,19 @@ final class SpiderRuntime {
         // s 可能是 null：上一轮收尾时会 loadUrl("about:blank")，那也会触发一次
         // onPageFinished，而那时 call() 已经把静态 session 清掉了。
         if (s == null || session != s || s.finished || s.injected) return;
+        // 只在宿主页上注入。迟到的 onPageFinished 可能属于上一份文档（此时 session
+        // 已经换成新调用的）：把源码注进旧文档，还会把 injected 置位 —— 等真正的
+        // 新宿主页加载完，onPageFinished 再来时反而被这个标志跳过，没人调 done，
+        // 白等满一场看门狗。校验不过就不置位直接返回，把注入机会留给宿主页。
+        String current = null;
+        try {
+            current = wv.getUrl();
+        } catch (Throwable ignored) {
+        }
+        if (current == null || !current.startsWith(HOST_PAGE)) {
+            Log.w(TAG, "跳过注入：当前文档不是宿主页（" + current + "）");
+            return;
+        }
         s.injected = true;
 
         // 直接执行，不包函数：spider 文件是 `__spiderSite = {...}` 这种顶层赋值，
@@ -1040,7 +1136,10 @@ final class SpiderRuntime {
             Object parsed = new JSONObject("{\"v\":" + (raw == null ? "null" : raw) + "}").opt("v");
             if (parsed instanceof JSONObject) out = (JSONObject) parsed;
         } catch (Throwable ignored) {
-            // 解析不出来就当没探到。
+            // 解析不出来就当没探到（前端回落到「让 spider 自己报错」），但不能
+            // 一声不吭 —— 否则「能力集是空的」在日志里查不到原因。
+            Log.w(TAG, "meta 探测结果解析失败，按空能力集处理：raw="
+                    + (raw == null ? "null" : raw.substring(0, Math.min(200, raw.length()))));
         }
         s.result = out == null ? new JSONObject() : out;
         Log.i(TAG, "cap=__meta ok ms=" + (System.currentTimeMillis() - s.beganAt)
@@ -1135,8 +1234,10 @@ final class SpiderRuntime {
                     // 走一遍 onPageFinished → inject，等于换了个干净的全局作用域。
                     wv.stopLoading();
                     wv.loadUrl("about:blank");
-                } catch (Throwable ignored) {
-                    // 清不干净就下次重建，不在收尾路径上抛。
+                } catch (Throwable cleanupFailed) {
+                    // 清不干净就下次重建，不在收尾路径上抛 —— 但要留一行，否则
+                    // 「页面没清干净」只会表现为下一次调用莫名的注入异常。
+                    Log.w(TAG, "清理宿主页失败，直接销毁：" + cleanupFailed);
                     destroyOnMain();
                     reuseCount = 0;
                 }
@@ -1160,9 +1261,11 @@ final class SpiderRuntime {
                 // headless：从未 attach，无需 removeView。
                 wv.destroy();
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable e) {
             // 销毁路径上什么都别抛：它要么在 Activity 退出流程里，要么在超时处置里，
-            // 抛出去只会把这两条路一起打断。
+            // 抛出去只会把这两条路一起打断。但销毁失败意味着渲染进程可能滞留，
+            // 必须留痕 —— 不然内存涨上去了没人知道为什么。
+            Log.w(TAG, "销毁宿主页失败（忽略）：" + e);
         }
     }
 
@@ -1245,6 +1348,10 @@ final class SpiderRuntime {
             return trimmed;
         } catch (Throwable e) {
             // 读不出来就按空白名单算：net 全拒。宁可拒绝，不能放行。
+            // 但必须留一行 —— 否则「net 全被拒」在日志里找不到原因，和站点挂了
+            // 根本分不开。
+            Log.w(TAG, "hosts 解析失败，按空白名单处理：raw="
+                    + (raw == null ? "null" : raw.substring(0, Math.min(200, raw.length()))));
             return EMPTY_HOSTS;
         }
     }

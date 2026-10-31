@@ -58,18 +58,41 @@ async function loadMarket(force = false) {
 // 所以「装配置」和「装脚本」是必须成对发生的两件事。裸 source set 只做前者，
 // 结果是配置生效了、spider 文件却不在于磁盘上 —— 之后每一次内容请求都报
 // 「找不到 spider: xxx」，用户看到的是一个装好了却什么都打不开的源。
+// 市场安装的全局互斥。app.js 的点击入口只 disable 被点的那一颗，A 还在装
+// （要走 source set + spider install 两趟桥）时点 B 会并发装两个源，谁最后
+// 落盘谁生效，全凭完成顺序。装上一颗未落定就拒绝新的。
+let marketInstalling = false;
+
 async function addSourceFromMarket(url) {
-  if (window.HGSetup && typeof window.HGSetup.addOneSource === 'function') {
-    const one = await window.HGSetup.addOneSource(url);
-    if (!one || one.ok === false) throw new Error((one && one.error) || '设置失败');
-    // 装的是「只有配置、脚本还没跟上」的源：把话说明白，别让人点进去撞空。
-    if (one.needsConfig) throw new Error('这个地址是爬虫脚本，还需要一份对应的源配置');
-  } else {
-    const result = await sourceCommand('set?url=' + encodeURIComponent(url));
-    if (!result || !result.ok) throw new Error((result && result.error) || '设置失败');
+  if (marketInstalling) {
+    toast('正在切换源，等这一轮结束再选');
+    return;
   }
-  toast('已切换到这个源，正在重启…');
-  restartAfterSource(() => { try { location.reload(); } catch (error) {} });
+  marketInstalling = true;
+  // 入口只按住了被点的那颗；这里把整组按住，别的行不再可点。
+  // 「使用中」那颗本来就该 disabled，整页重画时由 renderMarket 恢复。
+  content.querySelectorAll('[data-market-use]').forEach(button => { button.disabled = true; });
+  try {
+    if (window.HGSetup && typeof window.HGSetup.addOneSource === 'function') {
+      const one = await window.HGSetup.addOneSource(url);
+      if (!one || one.ok === false) throw new Error((one && one.error) || '设置失败');
+      // 装的是「只有配置、脚本还没跟上」的源：把话说明白，别让人点进去撞空。
+      if (one.needsConfig) throw new Error('这个地址是爬虫脚本，还需要一份对应的源配置');
+    } else {
+      const result = await sourceCommand('set?url=' + encodeURIComponent(url));
+      if (!result || !result.ok) throw new Error((result && result.error) || '设置失败');
+    }
+    // 到这里安装已成功、重启已排上；页面马上整体重载，标志不必（也不该）解开 ——
+    // 重载后是全新一份模块状态。
+    toast('已切换到这个源，正在重启…');
+    restartAfterSource(() => { try { location.reload(); } catch (error) {} });
+  } catch (error) {
+    marketInstalling = false;
+    // 按钮整组是我按住的，失败就得整组放开。整页重画最干净：
+    // 「使用中」那颗本来就 disabled，不能被我一把 false 解了禁。
+    if (state.route === 'market') renderMarket();
+    throw error;
+  }
 }
 
 function renderMarket() {

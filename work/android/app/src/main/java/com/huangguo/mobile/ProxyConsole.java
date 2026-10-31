@@ -210,7 +210,6 @@ final class ProxyConsole {
             throws Exception {
         String text = link == null ? "" : link.trim();
         boolean hasNodeJson = nodeJson != null && nodeJson.trim().length() > 0;
-        if (text.length() > 0) setProxyLink(context, text);
         // 存过的那条留到**解析成功之后**才用：一条粘贴错的链接如果先落盘再解析，
         // 用户下次点「保存并启动」会拿到上次那条坏链接，报的错还跟这次无关。
         // 所以这里只读不写，落盘在下面的解析成功处。
@@ -347,6 +346,8 @@ final class ProxyConsole {
             UserSource.log("代理：盘上有手填地址但模式是直连，迁移成「外部地址」");
         } catch (Throwable e) {
             // 迁移失败不该拦住任何东西：大不了这次还是直连，用户去设置页点一下就好。
+            // 但失败本身要留痕 —— 静默吞了的话，用户停在直连而谁也不知道为什么。
+            UserSource.log("代理模式迁移失败：" + e.getClass().getSimpleName() + " " + e.getMessage());
         }
     }
     /**
@@ -782,6 +783,15 @@ final class ProxyConsole {
         node.serviceName = json.optString("serviceName", "");
         node.flow = json.optString("flow", "");
         node.fingerprint = json.optString("fingerprint", "");
+        // 这批也直接决定握手/带宽（与 ProxyCore.sameNode 的比对口径一致）：
+        // 漏读的话 sni-only 的 TLS 节点拿 host 去过校验、reality 缺公钥起不来、
+        // hy2 的 BBR 没有初速度 —— 全是「配置生成成功但连不上」的静默错误。
+        node.sni = json.optString("sni", "");
+        node.publicKey = json.optString("publicKey", "");
+        node.shortId = json.optString("shortId", "");
+        node.allowInsecure = json.optBoolean("allowInsecure", false);
+        node.upMbps = json.optInt("upMbps", 0);
+        node.downMbps = json.optInt("downMbps", 0);
         return node;
     }
 }

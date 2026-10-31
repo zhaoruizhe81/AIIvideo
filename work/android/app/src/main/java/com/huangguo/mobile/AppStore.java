@@ -2,6 +2,7 @@ package com.huangguo.mobile;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 
@@ -82,6 +83,9 @@ final class AppStore {
         try {
             return new JSONObject(this.preferences.getString(key, "{}"));
         } catch (Exception unused) {
+            // 落盘的 JSON 读不回来时按空处理 —— 静默的话「数据坏了」就无痕消失，
+            // 这里至少留一句给 logcat 对账。
+            Log.w("AIIvideo", "[store] 本地数据读不出来，按空处理 key=" + key);
             return new JSONObject();
         }
     }
@@ -97,9 +101,30 @@ final class AppStore {
             String userPrefix = "user:" + userId + ":";
             editor.putString(userPrefix + "bookmarks", mergeRecords(readObject("bookmarks"), readObject(userPrefix + "bookmarks"), "addedAt").toString());
             editor.putString(userPrefix + NotificationCompat.CATEGORY_PROGRESS, mergeRecords(readObject(NotificationCompat.CATEGORY_PROGRESS), readObject(userPrefix + NotificationCompat.CATEGORY_PROGRESS), ParseObject.KEY_UPDATED_AT).toString());
+            // 匿名期的墓碑必须一并带走：不带走的话云同步查不到「删过」的记录，
+            // 匿名期删掉的收藏/历史会被云端那份原样复活。
+            editor.putString(userPrefix + "bookmarkDeleted", mergeTombstones(readObject("bookmarkDeleted"), readObject(userPrefix + "bookmarkDeleted")).toString());
+            editor.putString(userPrefix + "historyDeleted", mergeTombstones(readObject("historyDeleted"), readObject(userPrefix + "historyDeleted")).toString());
             editor.remove("bookmarks").remove(NotificationCompat.CATEGORY_PROGRESS).remove("bookmarkDeleted").remove("historyDeleted");
         }
         editor.putString("activeUserId", userId).apply();
+    }
+
+    /**
+     * 墓碑合并：形状是 { id: 删除时刻 }，值本身就是时间戳（没有记录体、没有额外
+     * 的时间戳字段），按 id 取两边较大者 —— 删除只认最新的那一次。
+     */
+    private static JSONObject mergeTombstones(JSONObject local, JSONObject remote) throws Exception {
+        JSONObject merged = new JSONObject(remote.toString());
+        Iterator<String> idIterator = local.keys();
+        while (idIterator.hasNext()) {
+            String id = idIterator.next();
+            long localAt = local.optLong(id);
+            if (localAt > merged.optLong(id)) {
+                merged.put(id, localAt);
+            }
+        }
+        return merged;
     }
 
     /**
@@ -128,6 +153,7 @@ final class AppStore {
                 cached = new JSONObject(raw);
             }
         } catch (Exception unused) {
+            Log.w("AIIvideo", "[store] 页面缓存读不出来，按未命中处理 key=cache:" + key);
             return null;
         }
         return cached;

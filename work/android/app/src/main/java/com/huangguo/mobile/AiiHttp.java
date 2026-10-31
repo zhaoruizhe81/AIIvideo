@@ -445,6 +445,87 @@ public final class AiiHttp {
     }
 
     /**
+     * 钉死 IP 的直连 GET —— DNS rebinding 防护的接口侧。
+     *
+     * <p>调用方先在受控环境解析一次域名，把拿到的地址组钉进来；这条请求的 DNS
+     * 只会答出这组地址，连接建立前后都<b>不存在第二次解析</b>，域名被污染/被
+     * rebinding 也劫不走流量。
+     *
+     * <p>行为边界（与 {@link #getRaw} 家族刻意不同，别顺手抹平）：
+     * <ul>
+     *   <li><b>只走直连</b>：代理摘掉 —— 钉死 IP 本身就是「认定了这条直连路径」；</li>
+     *   <li><b>失败直接抛</b>：不做 h2→h1 降级、不做路由换路重试 —— 任何回退都会
+     *       重新解析域名，防护就白做了；</li>
+     *   <li><b>不进路由记忆</b>：钉死 IP 的成败学进 {@link RouteMemory} 会污染
+     *       正常路由，这条路径完全绕开 routeAndSend；</li>
+     *   <li>超时沿用 getRaw 默认（连接 8s / 读 15s），源声明的响应头模板不套
+     *       （调用方无源上下文）；防盗链所需的 Referer 由调用方经
+     *       {@code extraHeaders} 自带 —— 与 getRaw 收 headers 的方式一致，
+     *       同名头后者覆盖。</li>
+     * </ul>
+     *
+     * @param extraHeaders 逐条挂到请求上（与 getRaw 同语义），null/空 = 不加
+     * @param pinnedAddrs  受控解析得到的地址组，空/null 直接拒绝
+     */
+    public static byte[] getRawPinned(String url, java.util.Map<String, String> extraHeaders,
+                                      java.net.InetAddress[] pinnedAddrs) throws Exception {
+        if (pinnedAddrs == null || pinnedAddrs.length == 0) {
+            throw new IOException("钉死地址为空，拒绝请求：" + hostOfUrl(url));
+        }
+        log("GET(pinned) " + hostOfUrl(url) + pathOfUrl(url)
+                + "（钉死 " + pinnedAddrs.length + " 个地址，只走直连、失败即抛）");
+        Response response = pinnedDirectClient(pinnedAddrs).newCall(pinnedRequest(url, extraHeaders)).execute();
+        try {
+            int code = response.code();
+            if (code < 200 || code >= 300) throw new IOException("HTTP " + code + " @ " + url);
+            ResponseBody body = response.body();
+            return body == null ? new byte[0] : body.bytes();
+        } finally {
+            response.close();
+        }
+    }
+
+    /** 两参便捷版：不带额外请求头。保住跨模块约定的短签名。 */
+    public static byte[] getRawPinned(String url, java.net.InetAddress[] pinnedAddrs) throws Exception {
+        return getRawPinned(url, null, pinnedAddrs);
+    }
+
+    /** 钉死请求的统一构造：identity 头 + 调用方的额外头（合并语义同 getRaw）。包内可见给单测。 */
+    static Request pinnedRequest(String url, java.util.Map<String, String> extraHeaders) {
+        Request.Builder builder = new Request.Builder().url(url)
+                .header("Accept-Encoding", "identity");
+        if (extraHeaders != null) {
+            for (java.util.Map.Entry<String, String> e : extraHeaders.entrySet()) {
+                builder.header(e.getKey(), e.getValue());
+            }
+        }
+        return builder.build();
+    }
+
+    /**
+     * 钉死 IP 的直连 client：DNS 对任何域名都答出恰好这组地址，代理摘掉。
+     *
+     * <p>从缓存 client 派生（newBuilder 共享连接池和重定向记录拦截器，参照
+     * {@link #getRaw} 的 h1 降级写法）。**不进 CLIENTS 缓存**：不同调用方的钉死
+     * 地址组各不相同，缓存键表达不了这个维度。
+     *
+     * <p>包内可见：单测直接验证「DNS 只答钉死地址」「不挂代理」两条。
+     */
+    static OkHttpClient pinnedDirectClient(java.net.InetAddress[] pinnedAddrs) {
+        final java.util.List<InetAddress> pinned = java.util.Arrays.asList(pinnedAddrs);
+        Dns pinnedDns = new Dns() {
+            @Override public List<InetAddress> lookup(String hostname) {
+                return pinned;
+            }
+        };
+        return clientFor(false, CONNECT_TIMEOUT, READ_TIMEOUT, null, null)
+                .newBuilder()
+                .proxy(null)
+                .dns(pinnedDns)
+                .build();
+    }
+
+    /**
      * 朴素的 GET，不带 profile、不走 DoH、不套 headers 模板。
      *
      * 给 CMS 适配器用：那边要拼自己的查询参数，也不该继承「我们站点」的请求头。
@@ -572,12 +653,21 @@ public final class AiiHttp {
         return false;
     }
 
-    /** 把路由落到 client 上：direct 现拼无代理 client（保留 AiiHttpDns），proxy 兜 proxiedClient。 */
+    /**
+     * 把路由落到 client 上：direct 手里这本就没代理就直接用（缓存的连接池/拦截器
+     * 都还在），带着代理才派生摘掉；proxy 兜 proxiedClient。
+     */
     private static OkHttpClient clientFor(OkHttpClient http, String route, SiteProfile profile) {
         if (RouteMemory.ROUTE_DIRECT.equals(route)) {
-            return new OkHttpClient.Builder()
-                    .connectTimeout(http.connectTimeoutMillis(), TimeUnit.MILLISECONDS)
-                    .readTimeout(http.readTimeoutMillis(), TimeUnit.MILLISECONDS)
+            // 手里这本本就直连（direct 模式下 client() 建的就是它）→ 原样用。
+            // 之前这里无条件 new 一个全新 client：每条请求一次新 TLS 握手、各自一个
+            // 连接池（idle 连接各留 5 分钟），还把重定向记录拦截器丢了。
+            if (http.proxy() == null) return http;
+            // 确需换路（这个域要直连，而手里的 client 带着代理）：派生而不是裸
+            // new —— newBuilder 共享连接池和拦截器，只摘代理。proxy(null) 与裸
+            // Builder 建的直连 client 同一状态（跟随系统 ProxySelector）。
+            return http.newBuilder()
+                    .proxy(null)
                     .dns(dnsFor(http, profile))
                     .build();
         }

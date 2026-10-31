@@ -1,6 +1,7 @@
 package com.huangguo.mobile;
 
 import android.app.Application;
+import android.util.Log;
 import com.parse.Parse;
 
 public final class HuangGuoApp extends Application {
@@ -24,7 +25,11 @@ public final class HuangGuoApp extends Application {
             @Override public void run() {
                 try {
                     ProxyCore.get(HuangGuoApp.this).ensureEnv();
-                } catch (Throwable ignored) {}
+                } catch (Throwable error) {
+                    // 预热失败不该崩进程，但也不能一点痕迹都没有 —— 不然预热一直
+                    // 坏着没人知道，测速/代理第一次永远多等那 3 秒。
+                    Log.d("AIIvideo", "[warmup] 代理核心预热失败：" + error);
+                }
             }
         }, "proxy-core-warmup").start();
 

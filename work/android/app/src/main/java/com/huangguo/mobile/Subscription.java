@@ -168,15 +168,19 @@ final class Subscription {
         // Clash YAML：以前直接拒（「请在机场后台改用 V2Ray 订阅」），但很多公开
         // 订阅只给 YAML。转成我们自己的链接格式再走下面同一套解析 —— 不引 YAML
         // 库，只认 proxies: 下面那几个字段。
+        String clashHint = null;
         if (looksLikeClash(text)) {
             List<String> converted = clashToLinks(text, result);
-            if (converted.isEmpty()) {
-                result.firstError = "这是 Clash 配置（YAML），但里面没有能识别的代理";
-                return result;
+            if (!converted.isEmpty()) {
+                StringBuilder joined = new StringBuilder();
+                for (String link : converted) joined.append(link).append('\n');
+                text = joined.toString();
+            } else {
+                // 有 proxies: 段但一条都没转出来。不急着报错退回 —— 原文里可能
+                // 混着裸链接，按普通节点列表再走一遍还能捞回来。一条都捞不到时
+                // 用这句兜底，它比 base64 分支那句「不是 base64」更有方向感。
+                clashHint = "这是 Clash 配置（YAML），但没有能识别的代理";
             }
-            StringBuilder joined = new StringBuilder();
-            for (String link : converted) joined.append(link).append('\n');
-            text = joined.toString();
         }
 
         // 整段 base64：解开后如果出现协议前缀，就当节点列表重走一遍。
@@ -184,6 +188,11 @@ final class Subscription {
             String decoded = tryDecodeBase64(text);
             if (decoded != null && containsScheme(decoded)) {
                 text = decoded;
+            } else if (clashHint != null) {
+                // Clash 转换失败且原文也不是节点列表。addClashLink 若记过更具体
+                // 的原因就保留它，否则用带方向的那句。
+                if (result.firstError == null) result.firstError = clashHint;
+                return result;
             } else if (decoded == null) {
                 result.firstError = "内容既不是节点列表也不是 base64";
                 return result;
@@ -247,6 +256,10 @@ final class Subscription {
                 }
             }
         }
+        // 回退路径一条链接都没捞到、也没有更具体的错：把 Clash 那句方向性提示补上。
+        if (result.size() == 0 && result.firstError == null && clashHint != null) {
+            result.firstError = clashHint;
+        }
         return result;
     }
 
@@ -260,7 +273,13 @@ final class Subscription {
     private static String signatureOf(XrayConfig.Node node) {
         return node.protocol + '|' + node.server + ':' + node.port + '|'
                 + node.uuid + '|' + node.network + '|' + node.path + '|' + node.host
-                + '|' + node.tls + '|' + node.serviceName;
+                + '|' + node.tls + '|' + node.serviceName
+                // sni / flow / reality 三件套 / 指纹同样改握手行为：漏了的话，
+                // 同机同 uuid 仅差这几个字段的节点会被误当重复剔掉。口径与
+                // ProxyCore.sameNode 一致 —— 那边漏比会拿缺参配置重启核心，
+                // 这里漏比会让真节点被去重吞掉。
+                + '|' + node.sni + '|' + node.flow + '|' + node.fingerprint
+                + '|' + node.publicKey + '|' + node.shortId;
     }
 
     /**
@@ -293,8 +312,8 @@ final class Subscription {
         return t.contains("vmess://") || t.contains("vless://")
                 || t.contains("trojan://") || t.contains("ss://")
                 || t.contains("hy2://") || t.contains("hysteria2://")
-                || t.contains("socks5://") || t.contains("http://")
-                || t.contains("https://");
+                || t.contains("socks5://") || t.contains("socks://")
+                || t.contains("http://") || t.contains("https://");
     }
 
     /** `xxx://...` 里的 `xxx`，取不到返回 null。 */
@@ -322,8 +341,8 @@ final class Subscription {
         return t.startsWith("vmess://") || t.startsWith("vless://")
                 || t.startsWith("trojan://") || t.startsWith("ss://")
                 || t.startsWith("hy2://") || t.startsWith("hysteria2://")
-                || t.startsWith("socks5://") || t.startsWith("http://")
-                || t.startsWith("https://");
+                || t.startsWith("socks5://") || t.startsWith("socks://")
+                || t.startsWith("http://") || t.startsWith("https://");
     }
 
     /**
@@ -367,6 +386,15 @@ final class Subscription {
                 if (cur != null) addClashLink(out, cur, result);
                 cur = new java.util.LinkedHashMap<String, String>();
                 t = t.substring(2).trim();
+                // 行内写法：`- {name: x, server: y, port: 443}` 一行就是一条完整
+                // 代理。摊平进 cur 后这条就齐了，直接收尾 —— 不摊平的话下面的
+                // key: value 解析会把它切碎成 "{name" 这类垃圾键，整条静默消失。
+                if (t.startsWith("{")) {
+                    putFlow(cur, "", t);
+                    addClashLink(out, cur, result);
+                    cur = null;
+                    continue;
+                }
             }
             if (cur == null || t.isEmpty()) continue;
 
@@ -470,7 +498,16 @@ final class Subscription {
         String type = lower(p.get("type"));
         String server = p.get("server");
         String port = p.get("port");
-        if (type.isEmpty() || server == null || server.isEmpty() || port == null) return;
+        if (type.isEmpty() || server == null || server.isEmpty() || port == null) {
+            // 认得出是条代理但缺 server/port：这条映射本身是坏的。记进 failed，
+            // 别静默消失 —— 用户数着「列表里有 10 条只出来 7 条」却找不到原因最难受。
+            result.failed++;
+            if (result.firstError == null) {
+                result.firstError = "Clash 代理缺 server/port"
+                        + (type.isEmpty() ? "" : "（" + type + "）");
+            }
+            return;
+        }
 
         String name = p.get("name");
         String hash = (name == null || name.isEmpty()) ? "" : "#" + urlEncode(name);
@@ -493,7 +530,12 @@ final class Subscription {
         }
         if ("hysteria2".equals(type) || "hy2".equals(type)) {
             String password = pick(p, "password", "auth", "auth-str");
-            if (password.isEmpty()) return;
+            if (password.isEmpty()) {
+                // 缺密码的映射转出去也连不上，记进 failed 让摘要对得上总数。
+                result.failed++;
+                if (result.firstError == null) result.firstError = "hysteria2 节点缺密码";
+                return;
+            }
             // 核心（v2fly v5 的 transport/internet/hysteria2）没有 obfs 实现，
             // Config 只有 password / congestion / ignore_client_bandwidth /
             // use_udp_extension 四项。带 salamander 的节点转出去也连不上，还会
@@ -520,7 +562,12 @@ final class Subscription {
         }
         if ("ss".equals(type)) {
             String cipher = p.get("cipher");
-            if (cipher == null || cipher.isEmpty()) return;
+            if (cipher == null || cipher.isEmpty()) {
+                // 缺加密方式的映射同样记账，别静默消失。
+                result.failed++;
+                if (result.firstError == null) result.firstError = "ss 节点缺加密方式（cipher）";
+                return;
+            }
             // 密码必须编码：带 @ / # 时会把后面那段错切成 host（hy2 分支同款写法）。
             out.add("ss://" + cipher + ":" + (pass == null ? "" : urlEncode(pass))
                     + "@" + server + ":" + port + hash);
@@ -666,9 +713,14 @@ final class Subscription {
     }
 
     private static boolean looksLikeClash(String text) {
-        String t = text.toLowerCase(Locale.ROOT);
-        return t.contains("proxies:") || t.contains("proxy-groups:")
-                || t.contains("mixed-port:") || t.contains("rules:");
+        // 必须真的有 proxies: 这一行才算。以前用 contains 做全文子串判定，一条
+        // 备注里带「rules:」字样的普通订阅会被误判成 Clash，然后整份按 YAML
+        // 解析丢光。逐行看行首（允许缩进）—— 没有 proxies: 段的文本里根本没有
+        // 代理可转，proxy-groups / rules 等其余键不构成依据。
+        for (String line : text.split("\r?\n")) {
+            if (line.trim().toLowerCase(Locale.ROOT).startsWith("proxies:")) return true;
+        }
+        return false;
     }
 
     /**

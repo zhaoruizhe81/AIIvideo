@@ -197,17 +197,17 @@ final class VlcRelay {
             // 单独判（2026-10-21 的回归就是这里只判了「绕不绕」、没判「走不走代理」，
             // 直连 CDN 被塞回境外节点，AGE 全挂）。
             if (!isPlaylistUrl(originalUrl)) {
-                try {
-                    String host = new java.net.URI(originalUrl).getHost();
-                    if (!NetRoute.mustProxy(host)) return null;
-                } catch (Exception ignored) {}
+                // host 提取走 Outbound 的唯一实现（HttpUrl 宽松优先）。原来这里自己
+                // new URI：带未转义字符（原始中文/空格/竖线）的地址解析失败被静默
+                // 跳过，直连域被包进中继、serve 里又被判成走代理出境 —— AiiHttp 侧
+                // 对同一地址判的是直连，两通道口径正好相反。
+                if (!Outbound.viaProxy(originalUrl)) return null;
             }
         }
         try {
             VlcRelay relay = ensure();
             if (relay.port() <= 0) return null;
-            return "http://127.0.0.1:" + relay.port() + PATH
-                    + "?u=" + encode(originalUrl);
+            return relayUrl("http://127.0.0.1:" + relay.port() + PATH + "?u=", originalUrl);
         } catch (Throwable e) {
             log("包地址失败，退回直连：" + e.getClass().getSimpleName() + " " + e.getMessage());
             return null;
@@ -262,6 +262,65 @@ final class VlcRelay {
         }
     }
 
+    // ── 本地中继的请求签名（防同机借用）────────────────────────────────
+    //
+    // 中继是绑在 127.0.0.1 的无鉴权代理，而 Android 各应用共享 loopback——
+    // 同机任意应用扫到端口就能拿 /s?u= 借道我们配的代理出口发任意请求、读回
+    // 响应体。给每个回指 URL 附一个 HMAC-SHA256 签名（进程内随机密钥），
+    // serve 侧验签：缺失 / 不符 / 与 u 对不上，一律 403。u 与 k 绑定，拆改无效。
+
+    /** 进程内随机密钥，懒加载一次。中继地址本来就只在本进程内有意义，无需持久化。 */
+    private static volatile byte[] relaySecret;
+
+    private static byte[] relaySecret() {
+        byte[] s = relaySecret;
+        if (s != null) return s;
+        synchronized (VlcRelay.class) {
+            s = relaySecret;
+            if (s == null) {
+                s = new byte[32];
+                new java.security.SecureRandom().nextBytes(s);
+                relaySecret = s;
+            }
+            return s;
+        }
+    }
+
+    /** HMAC-SHA256(密钥, target) 的 base64url 无 padding 串。 */
+    static String signFor(String target) {
+        try {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(relaySecret(), "HmacSHA256"));
+            return java.util.Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(mac.doFinal(target.getBytes(StandardCharsets.UTF_8)));
+        } catch (Throwable e) {
+            // 签不出来就别发无签名的地址（serve 一律 403）：wrap() 会接住退直连，
+            // 至少日志里有痕，好过静默黑屏。
+            throw new IllegalStateException("中继签名失败：" + e, e);
+        }
+    }
+
+    /** 验签：k 必须恰好是对这条 target 的签名（u 与 k 绑定）。常量时间比较。 */
+    static boolean verifyFor(String target, String k) {
+        if (k == null || k.length() == 0) return false;
+        try {
+            return java.security.MessageDigest.isEqual(
+                    signFor(target).getBytes(StandardCharsets.US_ASCII),
+                    k.getBytes(StandardCharsets.US_ASCII));
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+
+    /**
+     * 统一的中继回指 URL 出口：prefix + u 的 base64url + 签名参数。
+     * 所有构造回指地址的地方（wrap 的播放地址、m3u8 改写里的分片/标签）都走这里，
+     * 漏一个就是 serve 403 黑屏。
+     */
+    static String relayUrl(String prefix, String target) {
+        return prefix + encode(target) + "&k=" + signFor(target);
+    }
+
     // ── 接客 ──────────────────────────────────────────────────────────
 
     private void start() {
@@ -284,8 +343,18 @@ final class VlcRelay {
                 handle(client);
             } catch (Throwable e) {
                 if (closed) return;
-                // 单条连接出错不该把整个中继带走。
+                // 单条连接出错不该把整个中继带走。但 accept 本身持续失败（fd 耗尽、
+                // 套接字坏了）会在这里空转 —— 不许静默（热更通道当年就是静默失败
+                // 断的没人发现），打一行日志，歇一小会儿再继续，别忙转。
                 closeQuietly(client);
+                log("accept 失败：" + e.getClass().getName()
+                        + (e.getMessage() == null ? "" : " " + e.getMessage()));
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
             }
         }
     }
@@ -303,6 +372,9 @@ final class VlcRelay {
 
     private void serve(Socket client) {
         Response response = null;
+        // 上游这条 Call 要一直攥在手里：客户端断开/serve 提前结束时把它取消，
+        // 别让上游连接和中继线程陪一个已死的客户端耗着（finally 里统一收口）。
+        okhttp3.Call call = null;
         String original = null;
         try {
             client.setSoTimeout(IDLE_MS);
@@ -346,6 +418,15 @@ final class VlcRelay {
                 return;
             }
 
+            // 验签先行（在挑路由、碰上游之前）：k 缺失 / 篡改 / 与 u 对不上，一律
+            // 403。中继虽只绑 127.0.0.1，但 Android 各应用共享 loopback，无签名等于
+            // 同机任意应用都能借道我们配的代理出口。
+            if (!verifyFor(original, param(query, "k"))) {
+                log("签名校验失败，拒绝 " + shortUrl(original));
+                writeSimple(out, 403, "Forbidden");
+                return;
+            }
+
             // 这一条该不该走代理：跟 wrap() 里同一个判据（NetRoute），
             // 不能再无条件跟随 effectiveProxy() —— 播放列表现在即使该直连也
             // 绕中继，直连域被塞回代理节点就会被 CDN 按地区拒（见 MediaProxy
@@ -356,7 +437,8 @@ final class VlcRelay {
                 // VLC 有时先探一次。发一个不带 body 的 GET 拿状态和长度。
                 Request.Builder probe = new Request.Builder().url(original).head();
                 applyHeaders(probe, headers, false, original);
-                response = MediaProxy.relayClient(viaProxy).newCall(probe.build()).execute();
+                call = MediaProxy.relayClient(viaProxy).newCall(probe.build());
+                response = call.execute();
                 writeHead(out, response);
                 return;
             }
@@ -383,7 +465,8 @@ final class VlcRelay {
             // （真机实测 v4.ppqrrs.com 的 index.m3u8 被 VLC 带 Range 请求，回 206，
             //  于是剔广告那段整个被跳过 —— 列表原样透传）。
             applyHeaders(builder, headers, isPlaylistUrl(original) || disguised(original), original);
-            response = MediaProxy.relayClient(viaProxy).newCall(builder.build()).execute();
+            call = MediaProxy.relayClient(viaProxy).newCall(builder.build());
+            response = call.execute();
             noteUpstream(response.code());
             log("上游 " + response.code() + " " + response.protocol()
                     + (viaProxy ? " 经代理 " : " 直连 ") + shortUrl(original));
@@ -501,6 +584,11 @@ final class VlcRelay {
                     + (original == null ? "" : " @" + shortUrl(original))
                     + (e.getMessage() == null ? "" : " " + e.getMessage()));
         } finally {
+            // 客户端断开（拖进度/退出）会以异常收场 —— 这时上游那条 Call 多半还
+            // 阻塞在读/写上（写不受客户端 SO_TIMEOUT 约束）。serve 既然到头了就
+            // 把它取消：cancel 会打断上游的阻塞读，response.close() 才能立刻回收
+            // 连接。Call 已正常完成时 cancel 是空操作，不用先判状态。
+            if (call != null) call.cancel();
             if (response != null) {
                 try {
                     response.close();
@@ -625,16 +713,18 @@ final class VlcRelay {
                 }
                 continue;
             }
-            String abs;
-            try {
-                abs = new java.net.URI(baseAbs).resolve(t).toString();
-            } catch (Exception e) {
-                abs = t;
+            String abs = resolveAbsOrNull(t, baseAbs);
+            if (abs == null) {
+                // 严格 URI 和 HttpUrl 都 absolute 化不了：原样保留、不包 u= ——
+                // 包了的话 serve 里 url() 直接抛异常，这条分片必挂；留着让 VLC
+                // 对它拿到的上一跳自行解析。不计入改写条数（它没被改写）。
+                sb.append(line).append('\n');
+                continue;
             }
             // 这里**不能**回头用 wrap()：它会把「直连表里的域名」退回原地址，
             // 而这条路上原地址就是 Cloudflare 的 403。必须让 VLC 的每一个
             // 请求都回到中继来。
-            sb.append(prefix).append(encode(abs)).append('\n');
+            sb.append(relayUrl(prefix, abs)).append('\n');
             rewrites++;
         }
         return new String[] { sb.toString(), String.valueOf(rewrites) };
@@ -928,12 +1018,36 @@ final class VlcRelay {
         }
     }
 
+    /**
+     * 相对行 absolute 化（给广告扫描那些只做特征分析的调用方用）：解析不出时
+     * 原样返回入参，不做兜底决定。
+     */
     private static String resolveAbs(String uri, String baseAbs) {
+        String abs = resolveAbsOrNull(uri, baseAbs);
+        return abs != null ? abs : uri;
+    }
+
+    /**
+     * 相对行 absolute 化的唯一实现：严格 {@code java.net.URI} 优先，失败退 OkHttp
+     * {@code HttpUrl} 宽松解析。
+     *
+     * <p>为什么要宽松回退：m3u8 行里会混进未转义字符（原始中文、空格、竖线）——
+     * java.net.URI 按 RFC 3986 拒收，可这些行 OkHttp（真正发请求的解析器）自己
+     * 就能处理。只认严格 URI 的话，这种行会被当成「解析失败」原样返回，上层把它
+     * 包进 {@code u=} 之后 serve 里 {@code url()} 直接抛异常，该分片必挂。
+     *
+     * @return 两条路都 absolute 化不了时返回 null（调用方自行兜底）
+     */
+    static String resolveAbsOrNull(String uri, String baseAbs) {
         try {
             return new java.net.URI(baseAbs).resolve(uri).toString();
         } catch (Exception e) {
-            return uri;
+            // 落到下面的 HttpUrl 宽松回退。
         }
+        okhttp3.HttpUrl base = okhttp3.HttpUrl.parse(baseAbs);
+        if (base == null) return null;
+        okhttp3.HttpUrl resolved = base.resolve(uri);
+        return resolved == null ? null : resolved.toString();
     }
 
     private static double parseExtinf(String tag) {
@@ -986,12 +1100,18 @@ final class VlcRelay {
                 else sb.append(line).append('\n');
                 continue;
             }
-            String abs = resolveAbs(t, baseAbs);
+            String abs = resolveAbsOrNull(t, baseAbs);
+            if (abs == null) {
+                // 同 rewriteM3u8：两条解析路都失败就原样保留，不包 u=（包了 serve
+                // 里 url() 必抛），也不计入改写条数。
+                sb.append(line).append('\n');
+                continue;
+            }
             // master 列表里的子列表也必须是中继地址 —— 否则 VLC 直接去拉媒体列表，
             // 中继只在 master 上转了一圈（实测 v4.ppqrrs.com：master 一眼过，
             // 真正的 886 段媒体列表全在直连里，剔广告等于没装）。
             if (needsRelayHop(abs) || isPlaylistUrl(abs)) {
-                sb.append(prefix).append(encode(abs)).append('\n');
+                sb.append(relayUrl(prefix, abs)).append('\n');
             } else {
                 // 直连分片：写绝对地址，VLC 自己去拉，中继不掺和。
                 sb.append(abs).append('\n');
@@ -1006,12 +1126,10 @@ final class VlcRelay {
         if (abs == null || abs.length() == 0) return false;
         if (disguised(abs)) return true;
         if (AiiHttp.effectiveProxy().length() == 0) return false;
-        try {
-            String host = new java.net.URI(abs).getHost();
-            return host != null && NetRoute.mustProxy(host);
-        } catch (Exception e) {
-            return false;
-        }
+        // 与 wrap/viaProxy 同一份 host 提取（HttpUrl 宽松优先），别再各写一份 new URI。
+        // 解析不出（hostOf 返回空串）时 mustProxy 按 false 算 —— 与原来 catch 返回
+        // false 的兜底一致。
+        return NetRoute.mustProxy(Outbound.hostOf(abs));
     }
 
     /** 这条地址是不是一份播放列表（按路径后缀判，交给中继自己改写）。 */
@@ -1039,6 +1157,11 @@ final class VlcRelay {
      *
      * <p>绝对地址照样包一层：{@code #EXT-X-KEY} 直接指向 CDN 的话，VLC 会绕过中继
      * 去连，而这个站的 CDN 域名既不在直连表里也没走代理，一样是连不上。
+     *
+     * <p>absolute 化走 {@link #resolveAbsOrNull}（严格 URI 优先、HttpUrl 宽松回退，
+     * 与分片行同一条规矩）。两条路都失败时该属性值<b>原样保留、不包 {@code u=}</b>
+     * —— 旧实现失败就把原值包进去，serve 里 {@code url()} 直接抛异常，KEY 解不开
+     * 的表现是能开播但永远黑屏。一条行里部分属性失败时只跳过失败的那处，其余照改。
      */
     static String rewriteTagUris(String line, String baseAbs, String prefix) {
         java.util.regex.Matcher m = TAG_URI.matcher(line);
@@ -1051,14 +1174,10 @@ final class VlcRelay {
             String val = m.group(1) != null ? m.group(1) : m.group(2);
             String quote = m.group(1) != null ? "\"" : "'";
             if (val == null || val.length() == 0 || val.startsWith(prefix)) continue;
-            String abs;
-            try {
-                abs = new java.net.URI(baseAbs).resolve(val).toString();
-            } catch (Exception e) {
-                abs = val;
-            }
+            String abs = resolveAbsOrNull(val, baseAbs);
+            if (abs == null) continue;   // 两条解析路都失败：原样保留这个属性，不包 u=
             out.append(line, last, m.start());
-            out.append("URI=").append(quote).append(prefix).append(encode(abs)).append(quote);
+            out.append("URI=").append(quote).append(relayUrl(prefix, abs)).append(quote);
             last = m.end();
             changed = true;
         }
@@ -1185,6 +1304,7 @@ final class VlcRelay {
             case 200: return "OK";
             case 206: return "Partial Content";
             case 400: return "Bad Request";
+            case 403: return "Forbidden";
             case 404: return "Not Found";
             case 416: return "Range Not Satisfiable";
             default: return "Status " + code;

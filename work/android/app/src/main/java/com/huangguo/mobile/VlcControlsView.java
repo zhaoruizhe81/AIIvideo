@@ -80,6 +80,16 @@ final class VlcControlsView {
         @Override public void run() { if (hintView != null) hintView.setVisibility(View.GONE); }
     };
 
+    /**
+     * 收提示专用的 Handler，全类共用一个实例。
+     *
+     * removeCallbacks 按 Handler 实例匹配消息（MessageQueue 要求 target 是同一个），
+     * 每次现起一个的话，上一条还没触发的定时永远删不掉 —— 表现是解锁后的
+     * 「已解锁」提示被先前锁定时那次的定时提前收掉。
+     */
+    private final android.os.Handler hintHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+
     VlcControlsView(Activity activity, Host host) {
         this.activity = activity;
         this.host = host;
@@ -286,7 +296,7 @@ final class VlcControlsView {
                 }
                 lastLockTap = now;
                 showHint("已锁定 · 再点一次解锁");
-                hideHintAfter(1400, new android.os.Handler(android.os.Looper.getMainLooper()));
+                hideHintAfter(1400);
             }
         });
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(44), dp(44),
@@ -389,16 +399,13 @@ final class VlcControlsView {
 
     /** 与 Activity 侧 hideHintSoon 语义一致：延迟 700ms 再收，立即隐藏会闪一下。 */
     void hideHintSoon() {
-        // 这层不是 View，没有自己的 postDelayed —— 学 buildLockButton 里那条路，
-        // 现起一个主线程 Handler 走 hideHintAfter（自带 removeCallbacks 去重）。
-        hideHintAfter(700, new android.os.Handler(android.os.Looper.getMainLooper()));
+        hideHintAfter(700);
     }
 
-    /** 延后收提示。宿主那边有自己的 Handler，这里只管取消自己那条。 */
-    void hideHintAfter(long delayMs, android.os.Handler ui) {
-        if (ui == null) return;
-        ui.removeCallbacks(hideHint);
-        ui.postDelayed(hideHint, delayMs);
+    /** 延后收提示。一律走自己的 Handler，前一条没触发的定时才能真正被取消。 */
+    void hideHintAfter(long delayMs) {
+        hintHandler.removeCallbacks(hideHint);
+        hintHandler.postDelayed(hideHint, delayMs);
     }
 
     // ── 显隐 ──────────────────────────────────────────────────────────

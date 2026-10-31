@@ -162,6 +162,15 @@ final class SiteFetchWebView {
     /** 回包体积上限。超过就当失败 —— 挑战页/错误页可以很大，真页面用不着。 */
     private static final int MAX_BODY = 4 * 1024 * 1024;
 
+    /**
+     * bin 通道（{@link #doFetchBytes} 的字节累加）的上限。
+     *
+     * <p>{@link #MAX_BODY} 只看文本那条路，bin 通道没有协议层体积约束 —— 一个被
+     * 误指到大文件（视频、压缩包）的地址会把整份响应堆进内存直到 OOM。分片几百
+     * KB、封面几十 KB 都远够，8MB 是十倍量级的闸。
+     */
+    private static final int MAX_BIN_BYTES = 8 * 1024 * 1024;
+
     /** 导航抓页面的上限。挑战 + 400KB 页面，走远程节点要给够。 */
     private static final long NAV_TIMEOUT_MS = 35_000L;
 
@@ -175,6 +184,21 @@ final class SiteFetchWebView {
 
     /** 等「稳定」的上限：一直在变的页面也得交出去，不能拖满整个导航预算。 */
     private static final long SETTLE_MAX_MS = 10_000L;
+
+    /**
+     * 发 target 前等 about:blank 落地的上限。
+     *
+     * <p>2026-10-31 审查发现：连发两条 loadUrl 时，第二条会把还没 commit 的第一条
+     * 顶掉 —— 从发 target 到目标页 commit 的整个窗口里，当前文档仍是上一份（往往
+     * 就是 warmup 列表页：complete、长度稳定），下面的 settle 采样按「4 次长度
+     * 不变」约 2 秒就把它当成目标内容收走。所以发 target 前先轮询确认 outerHTML
+     * 缩到 512 以下；等不到就不往下走 —— 空白没确认，后面的 URL 校验也分不清
+     * 「没清干净的旧文档」和「站内跳转后的文档」（两者都是同 host 不同 path）。
+     */
+    private static final long BLANK_WAIT_MS = 5_000L;
+
+    /** 跳转后的文档算「稳定」的下限（跟主采样同一个节奏：4 次 × 400ms）。 */
+    private static final int FOREIGN_STABLE_HITS = 4;
 
     /** 图片通道等解码的上限。封面几十 KB，慢网也就几秒。 */
     private static final long IMAGE_TIMEOUT_MS = 12_000L;
@@ -515,13 +539,39 @@ final class SiteFetchWebView {
                     if (webView != null) webView.loadUrl("about:blank");
                 }
             });
-            Thread.sleep(200);
+            // 等 about:blank 真的落地再发 target（理由见 BLANK_WAIT_MS 的注释：
+            // 第二条 loadUrl 会顶掉还没 commit 的第一条，旧文档会被 settle 采样
+            // 当成目标内容收走 —— 那正是「抓回来的页面解析不出卡片」的一类根因）。
+            long blankDeadline = System.currentTimeMillis() + BLANK_WAIT_MS;
+            boolean blankConfirmed = false;
+            while (System.currentTimeMillis() < blankDeadline) {
+                Thread.sleep(200);
+                String len = evalOnPage(
+                        "(function(){var h=document.documentElement;"
+                                + "return h?String(h.outerHTML.length):'';})()");
+                int n = parseIntSafe(len, -1);
+                if (n >= 0 && n < 512) {
+                    blankConfirmed = true;
+                    break;
+                }
+            }
+            if (!blankConfirmed) {
+                throw new IOException("上一份文档没有卸载干净（"
+                        + (BLANK_WAIT_MS / 1000) + " 秒没等到空白页，渲染线程多半被占住），"
+                        + "这次抓取放弃：" + absoluteUrl);
+            }
             onMain(new Runnable() {
                 @Override
                 public void run() {
                     if (webView != null) webView.loadUrl(target);
                 }
             });
+
+            // 采样只认「地址对得上目标」的文档：跳转（挑战通过后的重定向、年龄
+            // 确认页）会把文档落到别的 path 上，那种样本不计入 stable —— 不然
+            // 两份不同页面的长度碰巧接近时，计数会串着涨。
+            final String targetHost = hostOf(absoluteUrl);
+            final String targetPath = pathOf(absoluteUrl);
 
             long deadline = System.currentTimeMillis() + NAV_TIMEOUT_MS;
             String html = "";
@@ -540,20 +590,52 @@ final class SiteFetchWebView {
             long settleBegan = 0;
             int lastLen = -1;
             int stable = 0;
+            // 跳转后的文档（地址对不上目标）单独计稳定：站点自己决定落的地址就是
+            // 该交的内容，不能因为它对不上目标 path 就拖满整个导航预算。
+            int foreignLen = -1;
+            int foreignStable = 0;
             while (System.currentTimeMillis() < deadline) {
                 Thread.sleep(400);
-                String len = evalOnPage("(function(){"
-                        + "if(document.readyState!=='complete')return '';"
-                        + "var h=document.documentElement;"
-                        + "return h?String(h.outerHTML.length):'';})()");
-                if (len.length() == 0) continue;
-                int n;
-                try {
-                    n = Integer.parseInt(len.trim());
-                } catch (Throwable bad) {
+                String probe = evalOnPage(pageProbeJs(targetHost, targetPath));
+                if (probe.length() == 0) continue;      // 还没 complete
+                if (probe.charAt(0) == 'B') {
+                    // complete 但还是空白/太小：多半是跳转途中的过场文档。
+                    // 文档换了，上一份的采样进度全部作废。
+                    settleBegan = 0;
+                    lastLen = -1;
+                    stable = 0;
+                    foreignLen = -1;
+                    foreignStable = 0;
                     continue;
                 }
+                boolean matched = probe.charAt(0) != 'M';
+                int n = matched ? parseIntSafe(probe, -1) : parseIntSafe(probe.substring(1), -1);
                 if (n < 512) continue;          // 还没渲染出东西
+                if (!matched) {
+                    // 地址对不上目标：不计入 stable，也不读全文（省一次大字符串往返）。
+                    // 但跳转后的页面自己稳定下来时，按「跳转结果」交出。
+                    settleBegan = 0;
+                    lastLen = -1;
+                    stable = 0;
+                    html = "";
+                    final int ftol = Math.max(80, foreignLen / 50);
+                    if (foreignLen > 0 && Math.abs(n - foreignLen) <= ftol) {
+                        foreignStable++;
+                    } else {
+                        foreignStable = 0;
+                    }
+                    foreignLen = n;
+                    if (foreignStable >= FOREIGN_STABLE_HITS) {
+                        html = evalOnPage("document.documentElement.outerHTML");
+                        log("目标发生跳转（落点不是 " + targetPath + "），按跳转后的页面返回 "
+                                + html.length() + " 字节 " + absoluteUrl);
+                        break;
+                    }
+                    continue;
+                }
+                // 地址对上了：跳转计数作废，回到主采样。
+                foreignLen = -1;
+                foreignStable = 0;
                 if (settleBegan == 0) settleBegan = System.currentTimeMillis();
                 String current = evalOnPage("document.documentElement.outerHTML");
                 if (current.length() < n * 9 / 10) continue;   // 读取过程被改写，重来
@@ -580,6 +662,8 @@ final class SiteFetchWebView {
                 }
             }
             if (html.length() == 0) {
+                // 兜底：能走到这说明一直没长完。空白在发车前已确认过，当前文档必然
+                // 是 target 或它的跳转结果，不会是上一份页面。
                 html = evalOnPage("document.documentElement.outerHTML");
             }
             if (html.length() == 0) {
@@ -884,6 +968,14 @@ final class SiteFetchWebView {
                 }
                 if (tag == 'C') {
                     if (payload == null || payload.length() == 0) return;
+                    // 体积闸：base64 解出来的字节约是 payload 长度的 3/4，粗估够用。
+                    // 超限当场判失败并放行等待方 —— 宁可这次取流报错，不能 OOM。
+                    if (p.bin.size() + payload.length() / 4 * 3 > MAX_BIN_BYTES) {
+                        p.reply = new Reply(false, p.binStatus, "",
+                                "取流累计超过 " + (MAX_BIN_BYTES / 1024 / 1024) + "MB 上限，中止");
+                        p.latch.countDown();
+                        return;
+                    }
                     p.bin.write(Base64.decode(payload, Base64.DEFAULT));
                     return;
                 }
@@ -1475,6 +1567,13 @@ final class SiteFetchWebView {
                     }
                     applyProxy(wv);
                     imageView = wv;
+                    // 图片通道的 WebView 也是「实例活着」的证据。alive 原来只有站点页
+                    // 那条路（ensureWebView）会置位，纯封面场景（主进程常常只用到
+                    // 封面通道，页面内容都在 :spider 进程）里它恒为 false —— get()
+                    // 每次都走替换分支，销毁重建整个实例，并发时还会把别的线程
+                    // 正在用的 imageView 拆掉。置位后 get() 认得这个实例，imageView
+                    // 才能真正被复用。
+                    alive = true;
                 } catch (Throwable e) {
                     failed[0] = e;
                 } finally {
@@ -1632,8 +1731,10 @@ final class SiteFetchWebView {
                 imageView = null;
             }
             passed = false;
-        } catch (Throwable ignored) {
-            // 销毁路径上什么都别做：抛出去只会打断 Activity 的销毁流程。
+        } catch (Throwable e) {
+            // 销毁路径上什么都别抛：抛出去只会打断 Activity 的销毁流程。
+            // 但销毁失败意味着渲染进程可能滞留，必须留一行 —— 不然泄漏查无实据。
+            log("销毁站点 WebView 失败（忽略）：" + e);
         }
     }
 
@@ -1719,6 +1820,50 @@ final class SiteFetchWebView {
         } catch (Exception e) {
             return "";
         }
+    }
+
+    /** 只取 path（尾斜杠归一，和 pageProbeJs 里对 document.URL 的处理一致）。 */
+    private static String pathOf(String url) {
+        String p = "/";
+        try {
+            p = new java.net.URI(url).getRawPath();
+        } catch (Throwable e) {
+            p = "/";
+        }
+        if (p == null || p.length() == 0) p = "/";
+        if (p.length() > 1 && p.endsWith("/")) p = p.substring(0, p.length() - 1);
+        return p;
+    }
+
+    /** parseInt 的不抛版本：探针回包脏了按 fallback 算，不中断采样循环。 */
+    private static int parseIntSafe(String s, int fallback) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Throwable bad) {
+            return fallback;
+        }
+    }
+
+    /**
+     * 采样探针：一次往返同时带回「文档地址是否对得上目标」和 outerHTML 长度。
+     *
+     * <p>返回值：{@code ''} = 还没 complete；{@code 'B'} = complete 但 outerHTML
+     * 还小（空白/过场）；{@code 'M'+长度} = 地址对不上目标（跳转或旧文档）；
+     * 纯数字 = 地址对得上。host/path 比对用 {@code <a>} 元素解析，老内核也有。
+     */
+    private static String pageProbeJs(String host, String path) {
+        return "(function(){"
+                + "if(document.readyState!=='complete')return '';"
+                + "var h=document.documentElement;"
+                + "if(!h)return '';"
+                + "var n=h.outerHTML.length;"
+                + "if(n<512)return 'B';"
+                + "var a=document.createElement('a');a.href=document.URL;"
+                + "var p=a.pathname;"
+                + "if(p.length>1&&p.charAt(p.length-1)==='/')p=p.substring(0,p.length-1);"
+                + "return (String(a.host).toLowerCase()===" + quote(host)
+                + "&&p===" + quote(path) + ")?String(n):('M'+n);"
+                + "})()";
     }
 
     private static void log(String message) {

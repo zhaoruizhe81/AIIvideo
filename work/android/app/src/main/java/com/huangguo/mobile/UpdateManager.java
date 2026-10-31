@@ -4,12 +4,10 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.os.Build;
+import android.util.Log;
 import androidx.core.app.NotificationCompat;
 import java.io.File;
-import java.io.FileInputStream;
-import java.security.MessageDigest;
 import java.util.ArrayList;
-import java.util.Locale;
 import java.util.regex.Pattern;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -55,7 +53,8 @@ final class UpdateManager {
     private static final Pattern VERSION = Pattern.compile("\\d+\\.\\d+\\.\\d+");
     private Candidate candidate;
     private final Context context;
-    private boolean downloading;
+    /** volatile：isDownloading() 是给桥做防重入预检的，不能等锁（download() 会握锁几分钟）。 */
+    private volatile boolean downloading;
     private final SharedPreferences preferences;
 
     interface Progress {
@@ -67,6 +66,15 @@ final class UpdateManager {
         return body == null ? null : new JSONObject(body);
     }
 
+    /**
+     * 桥的 download-update 处理器在入口用它做防重入预检。故意**不加 synchronized**：
+     * download() 全程握着实例锁，同步读会等几分钟才返回，而且等到了多半是 false，
+     * 预检就失去了意义。读 volatile，瞬时返回。
+     */
+    public boolean isDownloading() {
+        return this.downloading;
+    }
+
     synchronized File download(Progress progress) throws Exception {
         Candidate target = this.candidate;
         if (this.downloading || target == null) {
@@ -75,9 +83,20 @@ final class UpdateManager {
         File dir = new File(this.context.getCacheDir(), "updates");
         dir.mkdirs();
         File apk = new File(dir, "AIIvideo-v" + target.version + "-release.apk");
+        // 清掉别的版本留下的旧安装包，别让 40MB 一份的文件在缓存里攒着。
+        File[] stale = dir.listFiles();
+        if (stale != null) {
+            for (File oldApk : stale) {
+                if (!oldApk.getName().equals(apk.getName()) && !oldApk.delete()) {
+                    Log.d("AIIvideo", "[update] 旧安装包删除失败：" + oldApk.getName());
+                }
+            }
+        }
         this.downloading = true;
         try {
-            return UpdateMirror.download(target.url, apk, progress, target.digest);
+            // 挑源（pick 会并发探速）放到真正要下载的这一刻才做：check()/cached()
+            // 是查更新路径，cached() 还是节流命中的回放缓存，都不该碰网络。
+            return UpdateMirror.download(UpdateMirror.pick(target.mirrors), apk, progress, target.digest);
         } finally {
             this.downloading = false;
         }
@@ -87,7 +106,8 @@ final class UpdateManager {
         String digest;
         String notes;
         long size;
-        String url;
+        /** 镜像原文（JSON 数组字符串）。挑最快的源放到 download() 时做，见 download() 内注释。 */
+        String mirrors;
         String version;
 
         private Candidate() {
@@ -154,14 +174,16 @@ final class UpdateManager {
 
         Candidate candidate = new Candidate();
         candidate.version = version;
-        // 清单里给了 urls 就从中挑最快的（那是发布时写死的，正常情况都走这条）。
+        // 清单里给了 urls 就把候选组原样存下来（发布时写死的，正常情况都走这条）；
         // 没给就自己拼 GitHub Releases 的地址 —— 而且**要带镜像**：裸的
-        // github.com/releases 地址在国内基本下不动，只挑一个等于挑了个最慢的。
+        // github.com/releases 地址在国内基本下不动。挑最快的源（UpdateMirror.pick，
+        // 要并发拉 256KB 探速）放到 download() 那一刻才做 —— 这段代码是 check() 和
+        // cached() 的共用路径，cached() 是节流命中的回放缓存，不能在这里碰网络。
         JSONArray mirrors = manifest.optJSONArray("urls");
         if (mirrors == null) {
             mirrors = new JSONArray(Endpoints.mirrorsOf(Endpoints.releaseUrl(tag, apkName)));
         }
-        candidate.url = UpdateMirror.pick(mirrors.toString());
+        candidate.mirrors = mirrors.toString();
         candidate.digest = "sha256:" + sha256;
         candidate.size = manifest.optLong("size");
         candidate.notes = manifest.optString("notes");
@@ -235,6 +257,10 @@ final class UpdateManager {
         String currentVersion = self.versionName;
 
         if (manifest == null) {
+            // 整条更新通道全断（镜像全挂/DNS 劫持）时，这是唯一能留下痕迹的地方 ——
+            // read() 里都是静默 return null，不抛异常，桥的统一上报拦不到它。
+            Log.d("AIIvideo", "[update] 更新清单拉不到：试了 "
+                    + UpdateMirror.parse(MANIFEST_URL).size() + " 个地址，按没有发布信息处理");
             clearCandidate();
             return status("unpublished");
         }
@@ -250,22 +276,5 @@ final class UpdateManager {
 
     private static JSONObject status(String state) throws Exception {
         return new JSONObject().put(NotificationCompat.CATEGORY_STATUS, state);
-    }
-
-    /** 边读边算 sha256，不把整包 APK 读进内存。 */
-    private static boolean matchesDigest(File file, String expected) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        byte[] buffer = new byte[65536];
-        try (FileInputStream in = new FileInputStream(file)) {
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                digest.update(buffer, 0, read);
-            }
-        }
-        StringBuilder hex = new StringBuilder("sha256:");
-        for (byte b : digest.digest()) {
-            hex.append(String.format(Locale.ROOT, "%02x", b & 0xff));
-        }
-        return hex.toString().equalsIgnoreCase(expected);
     }
 }

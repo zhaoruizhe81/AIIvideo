@@ -184,6 +184,65 @@ final class SiteProfile {
     }
 
     String coverUrl(String str) throws Exception {
+        return coverUrl(str, null);
+    }
+
+    /**
+     * 三档判定后的封面地址（方案 §4.1，2026-10-31）。
+     *
+     * <p>{@code trustedHosts} 是观测集的查询口（B 档）：白名单不中但裸拉成功过的
+     * 主机照样放行。传 {@code null} 就是老行为 —— 只认名单。SiteProfile 保持
+     * 不碰 prefs / Context，观测集那层在 {@link CoverTrustStore}，调用方拼装。
+     */
+    String coverUrl(String str, java.util.function.Predicate<String> trustedHosts) throws Exception {
+        CoverTarget target = coverTarget(str);
+        if (target.tier == CoverTier.DECLARED) {
+            return target.uri.toString();
+        }
+        if (trustedHosts != null && trustedHosts.test(target.host)) {
+            return target.uri.toString();
+        }
+        // 带上被拒的主机和白名单 —— 线上的 90 条「无效封面域名」原文只有五个字，
+        // 拿不到 host 就无法判断该往 allowedHosts 里补什么，等于白报。
+        throw new IllegalArgumentException("无效封面域名：" + target.host
+                + "（白名单：" + object("cover").getJSONArray("allowedHosts") + "）");
+    }
+
+    // ── 信任三档（docs/history/2026-10-31-封面信任模型改造方案.md §4.1）─────
+    //
+    // DECLARED：host 命中 allowedHosts —— 声明信任，带源 header、走源路由。
+    // OBSERVED：host 在观测集里 —— 观测信任，取数行为同 DECLARED。
+    //   （这一档由 SiteRepository 拿 CoverTrustStore 判，SiteProfile 不碰 prefs。）
+    // UNKNOWN：都不命中 —— 调用方决定要不要裸拉试一次。
+    //
+    // 三档共享一道硬地板：rejectHard。不管名单写了什么、主机从哪来（配置、
+    // hostRewrites、观测集），这几类一律不放行 —— 名单只能收紧地板，不能洞穿它。
+
+    /** 封面主机信任档位。 */
+    enum CoverTier { DECLARED, OBSERVED, UNKNOWN }
+
+    /** coverTarget 的产物：归一化（hostRewrites 已套用、fragment 已剥）后的地址与档位。 */
+    static final class CoverTarget {
+        final URI uri;
+        /** hostRewrites 之后的小写主机。 */
+        final String host;
+        final CoverTier tier;
+
+        CoverTarget(URI uri, String host, CoverTier tier) {
+            this.uri = uri;
+            this.host = host;
+            this.tier = tier;
+        }
+    }
+
+    /**
+     * 硬地板 + 归一化 + 档位判定，不抛「无效封面域名」（那是 coverUrl 的活）。
+     *
+     * <p>coverData 需要在白名单不中时先看观测集、再决定要不要裸拉 —— 老的
+     * coverUrl 一票否决就做不了这件事。这里把「拒绝畸形地址」「重写主机」
+     * 「判定名单档位」三步拆开给调用方用。
+     */
+    CoverTarget coverTarget(String str) throws Exception {
         URI uri = new URI(str);
         String host = uri.getHost();
         if (!ProxyConfig.MATCH_HTTPS.equals(uri.getScheme()) || host == null || uri.getUserInfo() != null) {
@@ -192,22 +251,55 @@ final class SiteProfile {
             // 还是带了 http，看这一个字符串就知道。
             throw new IllegalArgumentException("无效封面地址：" + str);
         }
-        JSONObject jSONObjectOptJSONObject = object("cover").optJSONObject("hostRewrites");
-        if (jSONObjectOptJSONObject != null && jSONObjectOptJSONObject.has(host)) {
-            String string = jSONObjectOptJSONObject.getString(host);
+        rejectHard(host, uri);
+        JSONObject rewrites = object("cover").optJSONObject("hostRewrites");
+        if (rewrites != null && rewrites.has(host)) {
+            String string = rewrites.getString(host);
             uri = new URI(ProxyConfig.MATCH_HTTPS, null, string, uri.getPort(), uri.getPath(), uri.getQuery(), null);
             host = string;
+            // hostRewrites 是配置里可信的一方，但地板不认人情：重写出来的主机
+            // 照样过一遍硬拒，防止「配置把封面重写到一个内网 IP」这种写法。
+            rejectHard(host, uri);
         }
-        JSONArray jSONArray = object("cover").getJSONArray("allowedHosts");
-        for (int i = 0; i < jSONArray.length(); i++) {
-            if (hostMatches(jSONArray.getString(i), host)) {
-                return uri.toString();
+        JSONArray allowed = object("cover").getJSONArray("allowedHosts");
+        for (int i = 0; i < allowed.length(); i++) {
+            if (hostMatches(allowed.getString(i), host)) {
+                return new CoverTarget(uri, host.toLowerCase(Locale.ROOT), CoverTier.DECLARED);
             }
         }
-        // 带上被拒的主机和白名单 —— 线上的 90 条「无效封面域名」原文只有五个字，
-        // 拿不到 host 就无法判断该往 allowedHosts 里补什么，等于白报。
-        throw new IllegalArgumentException("无效封面域名：" + host
-                + "（白名单：" + jSONArray.toString() + "）");
+        return new CoverTarget(uri, host.toLowerCase(Locale.ROOT), CoverTier.UNKNOWN);
+    }
+
+    /** 安全地板：不管名单怎么写，这几类一律不放行（方案 §4.1 的硬性拒绝）。 */
+    private static void rejectHard(String host, URI uri) {
+        if (uri.getFragment() != null) {
+            throw new IllegalArgumentException("无效封面地址：带 fragment（" + host + "）");
+        }
+        if (host.length() > 253) {
+            throw new IllegalArgumentException("无效封面地址：主机名超长（" + host.length() + " 字符）");
+        }
+        if (isLiteralIp(host)) {
+            throw new IllegalArgumentException("无效封面地址：主机是字面 IP（" + host + "）");
+        }
+        if (host.toLowerCase(Locale.ROOT).endsWith(".local")) {
+            throw new IllegalArgumentException("无效封面地址：.local 主机（" + host + "）");
+        }
+    }
+
+    /**
+     * 主机是不是字面 IP。点分十进制、纯数字整数、带冒号的 IPv6、0x 十六进制段
+     * 都算 —— SSRF 那套「换进制绕白名单」的老把戏在形状上就认得出来。
+     * 正常域名只要有一段既不是纯数字也不是 0x 十六进制，就不是 IP。
+     */
+    static boolean isLiteralIp(String host) {
+        String h = host.toLowerCase(Locale.ROOT);
+        if (h.indexOf(':') >= 0) return true;
+        if (h.indexOf('.') < 0) return h.matches("[0-9]+");
+        for (String part : h.split("\\.", -1)) {
+            if (part.isEmpty()) return true;
+            if (!part.matches("[0-9]+") && !part.matches("0x[0-9a-f]+")) return false;
+        }
+        return true;
     }
 
     /**

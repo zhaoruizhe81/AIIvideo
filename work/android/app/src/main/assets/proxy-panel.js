@@ -181,7 +181,9 @@ async function loadNodesStatus() {
  */
 async function refreshNodesFeed() {
   const sub = subState();
-  if (sub.busy || sub.nodesBusy) return;
+  // 测速跑着的时候别来捣乱：下面会把 freeSpeed/freeNote 清空，正在跑的那轮
+  // 下一批又把列表写回来，中间状态闪一次、计数对不上。和测速按钮同一把守卫。
+  if (sub.busy || sub.nodesBusy || sub.freeTesting || sub.subTesting) return;
   sub.nodesBusy = true;
   sub.nodesNote = '正在获取…';
   sub.freeSpeed = [];
@@ -225,7 +227,11 @@ async function refreshNodesFeed() {
  * 被扔回「返回设置」，体验很糟。
  */
 function renderProxySettingsKeepScroll() {
-  const scroll = document.scrollingElement ? document.scrollingElement.scrollTop : 0;
+  // 滚动容器是 #scroll（html/body 是 overflow:hidden，document 永远滚不动），
+  // 保存/恢复必须认它 —— 之前写 document.scrollingElement，那上面恒是 0，
+  // 等于没保，测速每批回来还是被弹回顶部。变量名也不能叫 scroll，
+  // 会把全局那个 #scroll 元素遮住。
+  const top = scroll.scrollTop;
   // 整页 innerHTML 换掉会连输入框一起重建：用户正在粘订阅地址、测速结果每批
   // 回来就重画一次，刚粘进去的那串就被「上次成功拉取的地址」覆盖了。
   // 所以重画前先把焦点那一格的 id / 值 / 光标位置记下来，重画后放回去。
@@ -234,7 +240,7 @@ function renderProxySettingsKeepScroll() {
   const focusValue = focusId ? active.value : '';
   const caret = focusId && typeof active.selectionStart === 'number' ? active.selectionStart : null;
   renderProxySettings();
-  if (document.scrollingElement) document.scrollingElement.scrollTop = scroll;
+  scroll.scrollTop = top;
   if (!focusId) return;
   const again = document.getElementById(focusId);
   if (!again || again.tagName !== 'INPUT') return;
@@ -405,7 +411,7 @@ function renderProxySettings() {
         <span class="settings-icon">${icon('market')}</span>
         <span class="settings-body"><strong>免费节点</strong><small>${esc(freeLine(sub))}</small></span>
         <span class="settings-tail">
-          <button type="button" class="settings-mini" data-proxy-sub="nodes-refresh"${sub.busy ? ' disabled' : ''}>${sub.nodesBusy ? '更新中…' : '更新'}</button>
+          <button type="button" class="settings-mini" data-proxy-sub="nodes-refresh"${sub.busy || sub.nodesBusy || sub.freeTesting || sub.subTesting ? ' disabled' : ''}>${sub.nodesBusy ? '更新中…' : '更新'}</button>
         </span>
       </div>
       <div class="settings-row is-action">

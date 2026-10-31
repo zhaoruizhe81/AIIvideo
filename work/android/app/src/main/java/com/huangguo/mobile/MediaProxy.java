@@ -158,7 +158,11 @@ public final class MediaProxy {
      * 为什么不能直接复用 {@link #client()}：那个 readTimeout 是 30 秒，是按
      * 「WebView 每次取一个 Range」设计的。VlcRelay 是把整条流顺序搬给 libVLC，
      * 一部片可能连着读几十分钟，中间只要有一次 30 秒没吐字节就会被掐断。
-     * 这里给 0（无限），断连由 TCP 自己发现 —— 用户按暂停时 VLC 会主动关连接。
+     *
+     * 读超时给 120 秒，不是 0（无限）：0 的话上游 CDN 一旦半开/停滞，中继线程
+     * 会永远卡在 read 上，线程和连接都不释放 —— VlcRelay 那头的 SO_TIMEOUT 只管
+     * 从 VLC 读请求，管不到上游这一段。120 秒足够盖过正常的慢段；真停滞由
+     * 超时收尾，VLC 会自己换一条连接重试。
      *
      * 注意不要把它和 mediaClient 混用同一个字段：两者的超时语义不同，
      * 谁覆盖谁都会让另一方行为出错。
@@ -195,7 +199,7 @@ public final class MediaProxy {
             direct = new OkHttpClient.Builder()
                     .protocols(Collections.singletonList(Protocol.HTTP_1_1))
                     .connectTimeout(15, TimeUnit.SECONDS)
-                    .readTimeout(0, TimeUnit.MILLISECONDS)
+                    .readTimeout(120, TimeUnit.SECONDS)
                     .writeTimeout(0, TimeUnit.MILLISECONDS)
                     .build();
             relayClientDirect = direct;
@@ -207,7 +211,7 @@ public final class MediaProxy {
         OkHttpClient.Builder builder = new OkHttpClient.Builder()
                 .protocols(Collections.singletonList(Protocol.HTTP_1_1))
                 .connectTimeout(15, TimeUnit.SECONDS)
-                .readTimeout(0, TimeUnit.MILLISECONDS)
+                .readTimeout(120, TimeUnit.SECONDS)
                 .writeTimeout(0, TimeUnit.MILLISECONDS);
         String broken = AiiHttp.attachProxy(builder, want);
         if (broken != null) log("中继代理地址认不出来，媒体直连：" + broken);
@@ -292,7 +296,9 @@ public final class MediaProxy {
             case 403: return "Forbidden";
             case 404: return "Not Found";
             case 416: return "Range Not Satisfiable";
-            default:  return "";
+            // 空串不行：WebResourceResponse 的 reasonPhrase 为空在部分实现上直接抛
+            // IllegalArgumentException，这条代理对未列举的状态码就整个失效了。
+            default:  return "Status " + code;
         }
     }
 }

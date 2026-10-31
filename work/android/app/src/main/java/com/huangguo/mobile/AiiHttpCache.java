@@ -75,6 +75,11 @@ final class AiiHttpCache {
                 Thread.currentThread().interrupt();
             }
             if (settled && inflight.body != null && inflight.fresh()) {
+                // 消费式摘除：这份字节只服务这一次，后续来要的走下面 PREFETCH（同样
+                // 一次性）。不摘的话条目在 fresh 窗口内一直躺着 —— settle 过的 latch
+                // await 秒回，60 秒内每次 get 都回这份启动快照，前端下拉刷新拿到的
+                // 也是旧字节，PREFETCH 的 remove-on-take 等于白设计。
+                WARMING.remove(hotKey, inflight);
                 log("等到预热结果 " + pathOfUrl(url) + " " + inflight.body.length + " 字节，等了 "
                         + (System.currentTimeMillis() - waited) + "ms");
                 return inflight.body;

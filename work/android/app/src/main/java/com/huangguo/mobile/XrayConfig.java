@@ -815,18 +815,25 @@ final class XrayConfig {
 
         String hostPort = text.substring(at + 1);
         int colon = hostPort.lastIndexOf(':');
-        if (colon <= 0) throw new IllegalArgumentException(protocol + " 链接缺端口");
-        String host = hostPort.substring(0, colon).trim();
         int port;
-        try {
-            port = Integer.parseInt(hostPort.substring(colon + 1).trim());
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(protocol + " 链接端口不是数字");
+        String host;
+        if (colon <= 0) {
+            // 没写端口：按协议缺省（vless/trojan/hy2 都传 443）。少数分享链接
+            // 会省掉端口，直接拒了等于把能用的节点判死。
+            host = hostPort.trim();
+            port = defaultPort;
+        } else {
+            host = hostPort.substring(0, colon).trim();
+            try {
+                port = Integer.parseInt(hostPort.substring(colon + 1).trim());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(protocol + " 链接端口不是数字");
+            }
         }
         if (host.isEmpty()) throw new IllegalArgumentException(protocol + " 链接缺服务器地址");
         if (port <= 0 || port > 65535) throw new IllegalArgumentException(protocol + " 链接端口越界：" + port);
 
-        Node node = new Node(protocol, host, port > 0 ? port : defaultPort);
+        Node node = new Node(protocol, host, port);
         node.uuid = userInfo;
         applyQuery(node, query);
         return node;

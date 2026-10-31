@@ -5924,3 +5924,29 @@ html[data-theme=dark] .search-history {
     transform:scale(.96);
     background:var(--panel);
 }
+
+/* ── 封面诊断页（方案 §4.5，仅 debug 构建有入口）──────────────────────── */
+/* 最近失败的条目：时间戳一列 + 正文。文本可能很长，允许换行不省略。 */
+.cover-diag-failures {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px 14px 12px;
+}
+.cover-diag-failure {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    font-size: 12.5px;
+    line-height: 1.45;
+    color: var(--text-soft, inherit);
+}
+.cover-diag-failure span:last-child {
+    word-break: break-all;
+    min-width: 0;
+}
+.cover-diag-time {
+    flex: none;
+    font-variant-numeric: tabular-nums;
+    opacity: .65;
+}

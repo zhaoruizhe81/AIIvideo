@@ -90,8 +90,10 @@ final class RouteMemory {
     static void learn(String host, String route) {
         if (host == null || host.length() == 0) return;
         if (!ROUTE_DIRECT.equals(route) && !ROUTE_PROXY.equals(route)) return;
-        Map<String, Entry> map = entries();
         synchronized (RouteMemory.class) {
+            // entries() 必须锁内取（与 opinion 一致）：锁外取到的 map 可能已被别的
+            // 线程/进程推进，锁内再 cache = 旧 map 会把刚写进去的条目整个盖掉。
+            Map<String, Entry> map = entries();
             Entry e = map.get(host);
             if (e == null) {
                 e = new Entry();
@@ -108,9 +110,10 @@ final class RouteMemory {
     /** 清掉一个域的记忆（两条路都刚失败时用：记忆已不可信，回落到规则层）。 */
     static void forget(String host) {
         if (host == null || host.length() == 0) return;
-        Map<String, Entry> map = entries();
-        if (!map.containsKey(host)) return;
         synchronized (RouteMemory.class) {
+            // 与 learn 同一条规矩：entries() 锁内取，别拿旧 map 盖掉别人的更新。
+            Map<String, Entry> map = entries();
+            if (!map.containsKey(host)) return;
             map.remove(host);
             cache = map;
             persist(map);

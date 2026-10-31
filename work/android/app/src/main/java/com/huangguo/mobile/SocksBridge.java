@@ -24,33 +24,51 @@ final class SocksBridge {
         socksHost = host;
         socksPort = targetPort;
         if (port > 0) return port;
-        server = new java.net.ServerSocket(0, 16, java.net.InetAddress.getByName("127.0.0.1"));
-        port = server.getLocalPort();
+        // 线程全程只认自己这个 server 实例：finally 清理时若 ensure() 已经重建过
+        // 新桥，绝不能顺手把新桥关掉、把新端口抹成 0。
+        final java.net.ServerSocket myServer =
+                new java.net.ServerSocket(0, 16, java.net.InetAddress.getByName("127.0.0.1"));
+        server = myServer;
+        port = myServer.getLocalPort();
         Thread thread = new Thread(new Runnable() {
             @Override
             public void run() {
                 int failures = 0;
-                while (true) {
-                    try {
-                        final java.net.Socket client = server.accept();
-                        failures = 0;
-                        Thread worker = new Thread(new Runnable() {
-                            @Override
-                            public void run() {
-                                try { serve(client); } catch (Throwable ignored) { closeQuietly(client); }
-                            }
-                        }, "socks-bridge-conn");
-                        worker.setDaemon(true);
-                        worker.start();
-                    } catch (Throwable e) {
-                        // 瞬时异常（EMFILE 之类）不能把线程杀掉：port 仍 >0，
-                        // ensure() 会一直返回这个死端口。只有 server 真被关了才退；
-                        // 其余记日志继续，连挂 8 次再退，防异常风暴空转烧 CPU。
-                        if (server == null || server.isClosed()) return;
-                        failures++;
-                        log("accept 失败(" + failures + ")：" + e);
-                        if (failures >= 8) return;
-                        try { Thread.sleep(50); } catch (InterruptedException ie) { return; }
+                try {
+                    while (true) {
+                        try {
+                            final java.net.Socket client = myServer.accept();
+                            failures = 0;
+                            Thread worker = new Thread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try { serve(client); } catch (Throwable ignored) { closeQuietly(client); }
+                                }
+                            }, "socks-bridge-conn");
+                            worker.setDaemon(true);
+                            worker.start();
+                        } catch (Throwable e) {
+                            // 瞬时异常（EMFILE 之类）不能把线程杀掉：port 仍 >0，
+                            // ensure() 会一直返回这个死端口。只有 server 真被关了才退；
+                            // 其余记日志继续，连挂 8 次再退，防异常风暴空转烧 CPU。
+                            if (myServer.isClosed()) return;
+                            failures++;
+                            log("accept 失败(" + failures + ")：" + e);
+                            if (failures >= 8) return;
+                            try { Thread.sleep(50); } catch (InterruptedException ie) { return; }
+                        }
+                    }
+                } finally {
+                    synchronized (SocksBridge.class) {
+                        // accept 线程退出（server 被关 / 连挂 8 次）就必须关 socket 并把
+                        // port 复位：不清零的话 ensure() 会一直把这个没人 accept 的死端口
+                        // 发出去，WebView 的外部 SOCKS 路径静默全断，只有重启进程才能恢复。
+                        // 静态字段还指着自己才清 —— 若已经重建过新桥，新桥的端口不能动。
+                        if (server == myServer) {
+                            closeQuietly(myServer);
+                            port = 0;
+                            log("桥 accept 线程已退出，端口复位，下次 ensure 会重建");
+                        }
                     }
                 }
             }

@@ -84,4 +84,29 @@ public class UpdateMirrorTest {
 
         assertTrue(UpdateMirror.newestOf(bodies).contains("1.0.24"));
     }
+
+    /**
+     * 有的镜像在 200 状态下吐 JSON 错误页（限流、上游故障），versionCode 缺失算 0。
+     * 让它当选的话，check() 会判「0 ≤ 已装版本」直接报「已是最新」，还会把本地
+     * 待更新的清单 clearCandidate() 抹掉，且 12 小时内不再真正查新。
+     */
+    @Test
+    public void versionCode缺失或非正的body不参选() {
+        List<String> bodies = new ArrayList<String>();
+        bodies.add("{\"error\":\"rate limited\"}");          // JSON 错误页，没 versionCode
+        bodies.add("{\"versionCode\":0}");                   // 显式 0
+        bodies.add("{\"versionCode\":-5}");                  // 负数
+
+        assertNull("错误页 JSON 不能当选，实际：", UpdateMirror.newestOf(bodies));
+    }
+
+    @Test
+    public void 错误页JSON混在正常清单里也不影响() {
+        List<String> bodies = new ArrayList<String>();
+        bodies.add("{\"error\":\"rate limited\"}");
+        bodies.add(manifest(10022, "1.0.22"));
+        bodies.add(manifest(10024, "1.0.24"));
+
+        assertTrue(UpdateMirror.newestOf(bodies).contains("1.0.24"));
+    }
 }

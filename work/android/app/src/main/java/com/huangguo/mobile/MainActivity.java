@@ -70,7 +70,7 @@ import org.json.JSONTokener;
  * ── 桥指令 ──
  * 40 条，全在 registerCommands() 里注册成 Map<String, Command>。
  * 加一条指令 = 加一行 commands.put(...)，不用碰 dispatch()。
- * 另有 4 条 content-* 留在 dispatch() 里，因为必须在内容源门禁之前执行。
+ * 另有 content-status 一条留在 dispatch() 里，因为必须在内容源门禁之前执行（双态的其余 content-* 已于 2026-10-19 拆除）。
  *
  * ── origin 迁移 ──
  * 老版本用 file:///android_asset/app.html 加载，file:// 的 origin 是 null，
@@ -166,6 +166,11 @@ public final class MainActivity extends Activity {
         String string = sharedPreferences.getString("siteFingerprint", "");
         if (!string.isEmpty() && !string.equals(site.fingerprint)) {
             this.store.clearCache();
+            // 指纹变了 = 换了源（或同源改了配置）。旧指纹名下的封面观测集和
+            // 参数记忆一起作废 —— CoverTrustStore/CoverParamMemory 是静态内存层，
+            // 跨 recreate 存活，不在这里定点清就一直是旧源的记录。
+            CoverTrustStore.reset(this, string);
+            CoverParamMemory.reset(this, string);
         }
         sharedPreferences.edit().putString("siteFingerprint", site.fingerprint).apply();
         this.migratingOrigin = !sharedPreferences.getBoolean("originMigrated", false);
@@ -304,9 +309,13 @@ public final class MainActivity extends Activity {
             if (this.this$0.isDestroyed()) {
                 return;
             }
+            // originMigrated 先落盘：解析 localStorage 失败只该丢成年确认态，
+            // 不能拖住迁移标记 —— 否则每次冷启动都重走一遍 file:// 迁移。
+            this.this$0.getSharedPreferences("hot-updates", 0).edit().putBoolean("originMigrated", true).apply();
             try {
-                this.this$0.getSharedPreferences("hot-updates", 0).edit().putBoolean("originMigrated", true).putBoolean("adultConfirmed", Text.REQUEST_HEADER_ENABLE_METADATA_VALUE.equals(new JSONTokener(str).nextValue())).apply();
-            } catch (Exception unused) {
+                this.this$0.getSharedPreferences("hot-updates", 0).edit().putBoolean("adultConfirmed", Text.REQUEST_HEADER_ENABLE_METADATA_VALUE.equals(new JSONTokener(str).nextValue())).apply();
+            } catch (Exception error) {
+                Log.w(TAG, "迁移读取 localStorage 失败，成年确认态没搬过来", error);
             }
             this.this$0.migratingOrigin = false;
             webView.getSettings().setAllowFileAccess(false);
@@ -480,6 +489,10 @@ public final class MainActivity extends Activity {
     }
 
     public void lambda$onResume$1() {
+        // 渲染进程崩掉（onRenderProcessGone 置 null）或重建后，sync 回包不能再往旧 WebView 上发。
+        if (isDestroyed() || this.webView == null) {
+            return;
+        }
         this.webView.evaluateJavascript("window.hgCloudSynced && window.hgCloudSynced()", null);
     }
 
@@ -532,10 +545,16 @@ public final class MainActivity extends Activity {
     }
 
     public void lambda$onActivityResult$1(JSONObject jSONObject) {
+        if (isDestroyed() || this.webView == null) {
+            return;
+        }
         this.webView.evaluateJavascript("window.hgAvatarUpdated && window.hgAvatarUpdated(" + jSONObject + ")", null);
     }
 
     public void lambda$onActivityResult$2(String str) {
+        if (isDestroyed() || this.webView == null) {
+            return;
+        }
         this.webView.evaluateJavascript(str, null);
     }
 
@@ -557,6 +576,9 @@ public final class MainActivity extends Activity {
             startActivity(intent);
         } catch (ActivityNotFoundException | IllegalArgumentException e) {
             Log.e(TAG, "无法打开系统安装程序", e);
+            if (isDestroyed() || this.webView == null) {
+                return;
+            }
             this.webView.evaluateJavascript("window.hgUpdateInstallError && window.hgUpdateInstallError()", null);
         }
     }
@@ -572,6 +594,10 @@ public final class MainActivity extends Activity {
                         MainActivity.this.resetBackProgress();
                         MainActivity.this.captureBackGeometry();
                         WebView webView = MainActivity.this.webView;
+                        // 渲染进程崩掉（onRenderProcessGone 置 null）或重建后不能再发 JavaScript。
+                        if (MainActivity.this.isDestroyed() || webView == null) {
+                            return;
+                        }
                         StringBuilder sb = new StringBuilder("window.hgPredictiveBackStart && window.hgPredictiveBackStart(");
                         sb.append(backEvent.getSwipeEdge() == 1);
                         sb.append(")");
@@ -586,6 +612,9 @@ public final class MainActivity extends Activity {
 
                     public void onBackCancelled() {
                         MainActivity.this.resetBackProgress();
+                        if (MainActivity.this.isDestroyed() || MainActivity.this.webView == null) {
+                            return;
+                        }
                         MainActivity.this.webView.evaluateJavascript("window.hgPredictiveBackCancel && window.hgPredictiveBackCancel()", null);
                     }
 
@@ -620,6 +649,10 @@ public final class MainActivity extends Activity {
     }
 
     public void captureBackGeometry() {
+        // 渲染进程崩掉（onRenderProcessGone 置 null）或重建后没有可量的 View，量不到就保留旧值。
+        if (isDestroyed() || this.webView == null) {
+            return;
+        }
         int[] iArr = new int[2];
         this.webView.getLocationOnScreen(iArr);
         this.backViewLeft = iArr[0];
@@ -866,7 +899,10 @@ public final class MainActivity extends Activity {
      * 名字与前端 AndroidHost.request(id, action, ...) 的 action 一一对应。
      */
     private void registerCommands() {
-        this.commands.put("app-version", jSONObject -> getPackageManager().getPackageInfo(getPackageName(), 0).versionName);
+        this.commands.put("app-version", jSONObject -> new JSONObject()
+                .put("version", getPackageManager().getPackageInfo(getPackageName(), 0).versionName)
+                // debug 标志给前端做「封面诊断」入口的显隐（仅 debug 构建可见）。
+                .put("debug", (getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0));
         // 热更已经停用（2026-10-19）。这条命令留着只为「老前端还发得出来时不至于抛异常」，
         // 直接应答即可 —— 前端那边整块 UI 也一起删了。
         this.commands.put("hot-ready", jSONObject -> true);
@@ -968,6 +1004,11 @@ public final class MainActivity extends Activity {
             return true;
         });
         this.commands.put("download-update", jSONObject -> {
+            // 更新下载是长任务（占通用池线程、进度回调一直往 UI 线程灌）。
+            // 防重入：连点两次「下载更新」时第二条直接报错，不排队。
+            if (this.updates.isDownloading()) {
+                throw new IllegalStateException("已有更新在下载中");
+            }
             final File fileDownload = this.updates.download(new UpdateManager.Progress() {
                 @Override
                 public final void onPercent(int i) {
@@ -995,6 +1036,16 @@ public final class MainActivity extends Activity {
         });
         this.commands.put("sync", jSONObject -> services().account.sync());
         this.commands.put("cover", jSONObject -> services().repository.coverData(jSONObject.optString("url")));
+        // 封面诊断（方案 §4.5，仅 debug 构建的设置页有入口）：观测集 + 最近失败
+        // + 冻结中主机，回答「此刻为什么没封面」。纯本地读，走本地单线程池。
+        this.commands.put("cover-diag", jSONObject -> {
+            Services s = services();
+            JSONObject out = new JSONObject();
+            out.put("observations", CoverTrustStore.dump(this, s.repository.profileForControl().fingerprint));
+            out.put("recentFailures", SiteRepository.recentCoverFailureDump());
+            out.put("frozenHosts", SiteRepository.frozenCoverHostDump());
+            return out;
+        });
         this.commands.put("login", jSONObject -> services().account.login(jSONObject.optString("username"), jSONObject.optString("password")));
         // ── spider 运行时（阶段 0）────────────────────────────────────────
         //
@@ -1173,10 +1224,17 @@ public final class MainActivity extends Activity {
     }
 
     public void showUpdateProgress(int i) {
+        // 下载进度回点可能晚于渲染进程崩溃 / 重建（onRenderProcessGone 置 null）。
+        if (isDestroyed() || this.webView == null) {
+            return;
+        }
         this.webView.evaluateJavascript("window.hgUpdateProgress && window.hgUpdateProgress(" + i + ")", null);
     }
 
     public void onUpdateDownloaded(File file) {
+        if (isDestroyed() || this.webView == null) {
+            return;
+        }
         if (file == null) {
             this.webView.evaluateJavascript("window.hgUpdateFailed && window.hgUpdateFailed()", null);
         } else {
@@ -1370,9 +1428,9 @@ public final class MainActivity extends Activity {
                 case "get-progress":
                 case "window-insets":
                 case "app-version":
-                case "age-status":
                 case "cached-update":
                 case "hot-update-status":
+                case "cover-diag":
                     return true;
                 default:
                     return false;
@@ -1538,10 +1596,16 @@ public final class MainActivity extends Activity {
     }
 
     public void lambda$refreshAccountAfterAuth$1() {
+        if (isDestroyed() || this.webView == null) {
+            return;
+        }
         this.webView.evaluateJavascript("window.hgCloudSynced && window.hgCloudSynced()", null);
     }
 
     public void lambda$refreshAccountAfterAuth$2(String str) {
+        if (isDestroyed() || this.webView == null) {
+            return;
+        }
         this.webView.evaluateJavascript(str, null);
     }
 

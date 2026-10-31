@@ -100,7 +100,10 @@ final class ProxyRoute {
         } else if (lower.startsWith("http://")) {
             text = text.substring(7);
         } else if (lower.startsWith("https://")) {
-            text = text.substring(8);
+            // 以前这里是剥掉 scheme 按明文 HTTP 代理用 —— 那等于拿明文 CONNECT
+            // 去怼一个 TLS 端口，连不上还看不出是这层意思。明确拒绝，别静默错走。
+            return new Parsed(null, "暂不支持 TLS 包裹的 HTTP 代理（https:// 前缀），"
+                    + "请填 http:// 或 socks5:// 形式的地址");
         }
 
         // 账号密码在 @ 之前。用 lastIndexOf：密码里带 @ 也不怕

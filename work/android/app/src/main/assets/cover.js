@@ -85,8 +85,51 @@
     let observer = null;
     let coverScrollTimer;
 
+    // ── 灰块上报（封面信任模型方案 §4.5，2026-10-31）──────────────────
+    //
+    // 按「页面灰块数」计数，不按「请求失败数」：Java 侧的负缓存会把失败合并、
+    // Report.Once 会把上报挡掉 —— 那批根本没发请求的封面在前端这里全看得见
+    // （占位字就是它们）。攒 15 秒合并成一条，防刷口径照 js-errors 的 MARKS：
+    // 首批必报，之后每满 10 个灰块再报一条。
+    const trackFn = typeof deps.track === 'function' ? deps.track : null;
+    let placeholderBuf = {};
+    let placeholderTimer = null;
+    let placeholderReported = 0;
+
+    function placeholderReason(message) {
+      const text = String(message || '');
+      if (/无法解码/.test(text)) return 'decode';
+      if (/刚刚失败过|冻结/.test(text)) return 'frozen';
+      if (/无效封面/.test(text)) return 'config';
+      if (/解密|不是图片/.test(text)) return 'decrypt';
+      return 'network';
+    }
+
+    function notePlaceholder(message) {
+      if (!trackFn) return;
+      const reason = placeholderReason(message);
+      placeholderBuf[reason] = (placeholderBuf[reason] || 0) + 1;
+      if (placeholderTimer) return;
+      placeholderTimer = setTimeout(() => {
+        placeholderTimer = null;
+        const reasons = placeholderBuf;
+        placeholderBuf = {};
+        let count = 0;
+        for (const key in reasons) count += reasons[key];
+        const previous = placeholderReported;
+        placeholderReported += count;
+        // 首批（之前一个都没报过）必报；之后跨过 10 的倍数再报。
+        if (previous === 0 || Math.floor(placeholderReported / 10) > Math.floor(previous / 10)) {
+          try { trackFn('cover', 'cover_placeholder', { count: count, reasons: reasons }); } catch (ignored) {}
+        }
+      }, 15000);
+    }
+
     function coverKey(url) {
-      try { return new URL(url).pathname; } catch { return String(url).split('?')[0]; }
+      // host 要进 key：同族加密图床的二级域在源之间轮换（c5e396f 的背景），
+      // 不同主机挂同一路径不是同一张图，只按 path 去重会把 A 源的字节灌给 B 源。
+      try { const parsed = new URL(url); return parsed.host + parsed.pathname; }
+      catch { return String(url).split('?')[0]; }
     }
 
     function get(url) {
@@ -123,12 +166,14 @@
       }
       image.dataset.loading = '1';
       const poster = image.closest('.poster');
+      // 字节是 Java 解密返回的，还是兜底直连的原址。失败分档（见下面 catch）靠它区分。
+      let fromJava = false;
       try {
         let data = '';
-        try { data = await get(url); }
+        try { data = await get(url); fromJava = true; }
         catch {
           await new Promise(resolve => setTimeout(resolve, 450));
-          try { data = await get(url); }
+          try { data = await get(url); fromJava = true; }
           catch { data = ''; }
         }
         // 取字节失败时，最后一条路是把原址直接交给 <img>。
@@ -160,7 +205,14 @@
           image.removeAttribute('src');
           poster?.classList.remove('loading');
           poster?.classList.add('fallback');
-          image.dataset.retryAfter = String(Date.now() + (error.message === '图片无法解码' ? 300000 : 30000));
+          // 冻结分两档：Java 给了字节、字节本身解不开（真坏数据）才值得冻 5 分钟；
+          // 兜底直连炸掉的（fromJava=false）根因是网络 / Java 层那次失败 —— 对密文
+          // 图床直连本来就必炸，按解码失败冻 5 分钟就成了「一次抖动整页灰五分钟」。
+          // c5e396f 在 Java 侧把主机冻结分了档，这里是前端这层的同款口径。
+          const decodeFromJava = error.message === '图片无法解码' && fromJava;
+          image.dataset.retryAfter = String(Date.now() + (decodeFromJava ? 300000 : 30000));
+          // 灰块落地了，记一笔（合并上报，见 notePlaceholder）。
+          notePlaceholder(error.message);
         }
         const id = image.closest('[data-open-id]')?.dataset.openId || image.closest('.hero-slide,.category-spotlight')?.querySelector('[data-open-id]')?.dataset.openId || 'unknown';
         console.warn('封面加载失败', id, (() => { try { return new URL(url).host; } catch { return 'invalid'; } })(), error.message);

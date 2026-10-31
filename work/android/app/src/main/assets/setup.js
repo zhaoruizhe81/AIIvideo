@@ -117,7 +117,10 @@
       apply.textContent = picked.length ? `添加 ${picked.length} 个源并进入` : '先勾选至少一个源';
     };
     checks.forEach(node => node.addEventListener('change', sync));
-    apply.addEventListener('click', () => addSelected(checks.filter(node => node.checked).map(node => node.value)));
+    // apply 是 app.html 里的静态按钮，offerMarket 每渲染一次都会走到这里。
+    // addEventListener 只会往上摞：第二回渲染后点一下，旧监听还握着上一轮
+    // 已经脱离 DOM 的勾选框，把两轮勾选的源一起装上。覆盖式赋值保证只有一个。
+    apply.onclick = () => addSelected(checks.filter(node => node.checked).map(node => node.value));
     showError('');
     return true;
   }
@@ -271,6 +274,8 @@
       try {
         const one = await addOneSource(urls[index]);
         if (!one.ok) failed.push(one.error || '设置失败');
+        // 源码装上了、配置还没跟上：这不算装好，跟 addSourceFromMarket 一个口径。
+        else if (one.needsConfig) failed.push('这个地址是爬虫脚本，还需要一份对应的源配置');
       } catch (error) {
         failed.push(error.message || '设置失败');
       }
@@ -295,6 +300,9 @@
   }
 
   async function submit() {
+    // 回车监听不看按钮的 disabled：点击提交进入「正在获取…」后再按回车，
+    // 会并发跑第二条安装链路。入口先挡一道。
+    if (button.disabled) return;
     const url = (input.value || '').trim();
     if (!url) { showError('请填写源地址'); return; }
 
@@ -330,6 +338,12 @@
         showError(marketMark
           ? '你贴的是一份源清单，但里面没有可用的源'
           : (message || '设置失败'));
+        return;
+      }
+      // 贴的是 .js：源码装上了，但还没有任何配置指向它，重启只会回到同一屏。
+      // 不重启，把下一步说清楚（配置里的 web.spider 会指回这份源码）。
+      if (one.needsConfig) {
+        showError('这个地址是爬虫脚本，还需要一份对应的源配置：源码已装好，再贴它的 .json 即可');
         return;
       }
       // 成功。这里**必须重建 Activity**，光 reload 页面是不够的 —— SiteProfile 是在

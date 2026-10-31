@@ -5,10 +5,65 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#f5f2e9" id="theme-color">
+  <!-- ── 内容安全策略 ────────────────────────────────────────────────────
+       把各处注释一直声称的「connect-src 'none'、网络一律走 Java」落成事实。
+       页面跑在 https://appassets.androidplatform.net（WebViewAssetLoader），'self' 即它。
+       逐条证据（2026-10-31 对 assets 全量 grep 的结论）：
+       · script-src 'unsafe-inline'：head 主题脚本、白屏兜底判据脚本、下面的 CSP
+         钩子、兜底面板的 onclick，全是刻意的内联。
+       · script-src 'unsafe-eval'：hxm/hxm.js 的 WebAssembly.instantiate 是 AGE动漫
+         解析层的活路径（wasm 字节 base64 内联在 hxm.wasm.js，不经网络）。Chrome 58
+         （minSdk 出厂 WebView）上 wasm 只认 'unsafe-eval'，'wasm-unsafe-eval' 要
+         Chrome 96+；主页面自身没有 eval/new Function，等 WebView 底线上到 96+
+         可以收窄成 'wasm-unsafe-eval'。
+       · img-src * data:：封面直连兜底把远程 https 原址直接喂 <img>（cover.js
+         loadInto），解密成功的封面是 data:image/jpeg;base64，app.css 的背景图是
+         data: SVG。全项目无 createObjectURL/toDataURL，不需要 blob:。
+       · connect-src 'none'：主页面全部 js/html 里 fetch / XMLHttpRequest /
+         WebSocket / EventSource / sendBeacon 零使用（唯一命中在 spider-host.html
+         的注释里，那是另一份文档、自带自己的 CSP）；hxm/http.js 走 HG_BRIDGE，
+         数据面全走 AndroidHost 桥（JS 接口对象，不是 CSP 管的网络原语）。
+       · media-src 'none'：唯一的 <video> 在 feed-player.js 的 render() 里，那段
+         状态机不可达（播放全程在原生 VLC）；没有 <audio>/new Audio。
+       · form-action 'none'：全部表单 preventDefault 后走桥，没有 .submit() 调用。
+       · frame-src / object-src / base-uri：无 iframe、无 object/embed、无 <base>。
+       spider-host.html 有自己的 meta CSP，与本页互不影响。 -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src * data:; font-src 'self' data:; connect-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
   <title>AIIvideo</title>
   <!-- 必须是第一个脚本：放后面就漏掉前面所有脚本的解析错误，而「某个分片没打进包 /
        语法坏了导致白屏」正是它最该抓到的那类故障。见 js-errors.js 文件头。 -->
   <script src="js-errors.js"></script>
+  <!-- CSP 违规观察钩子：真机上验证策略没误伤靠它。track（上报）定义在 app.js ——
+       整包最后一个脚本，这里比它早得多，所以违规先进缓冲，track 一就绪当场补发；
+       三个定时器兜「早期违规之后再也没有违规」的场景。缓冲上限 20 条：每条要走
+       一次 report 桥，有上限就不会被坏循环刷爆（Java 侧 ReportQueue 另有自己的
+       防刷）。手写 ES5，同下面那段判据脚本的约束。若这份策略把 js-errors.js 本身
+       误拦了，这里收不到违规，但 boot-fail 面板会亮 stage:'hook' —— 两条路都通。 -->
+  <script>
+    (function () {
+      var pending = [];
+      function clip(value) {
+        var text = String(value == null ? '' : value);
+        return text.length > 120 ? text.slice(0, 120) : text;
+      }
+      function flush() {
+        if (typeof track !== 'function') return;
+        while (pending.length) {
+          try { track('js', 'csp_violation', pending.shift()); } catch (ignored) {}
+        }
+      }
+      document.addEventListener('securitypolicyviolation', function (event) {
+        if (pending.length < 20) {
+          pending.push({ directive: clip(event.violatedDirective), block: clip(event.blockedURL) });
+        }
+        flush();
+      });
+      window.setTimeout(flush, 3000);
+      window.setTimeout(flush, 8000);
+      window.setTimeout(flush, 15000);
+    })();
+  </script>
   <script>
     /* 主题要在 CSS 之前定下来。放到 app.js 里会先画一帧浅色再翻成深色，
        冷启动的闪白在 OLED 上特别明显。这里只读偏好、算一次，不碰任何 DOM。 */

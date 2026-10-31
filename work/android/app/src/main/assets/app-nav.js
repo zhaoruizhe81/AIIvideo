@@ -145,7 +145,9 @@ async function goHome() {
   refreshing.catch(() => {});
   const library = await api('library').catch(() => null);
   if (token !== routeToken) return;
-  state.library = library;
+  // 拉取失败（null）不能清掉手上已有的片单 —— 那会把「我的」和继续观看
+  // 从有数据退化成空态/错误页。只认成功的结果（refreshHomeHistory 同一口径）。
+  if (library) state.library = library;
   let fresh;
   try {
     fresh = await refreshing;
@@ -524,7 +526,9 @@ function sourceItem(id) {
   // 详情页从列表回推标题就靠它，整句解析失败的话详情页直接白屏。
   const candidates = [state.listing?.items, state.home?.featured, state.home?.homepageRecommend, state.home?.homepageNewest, state.home?.recommend?.items, state.home?.newest?.items, state.category?.items, state.search?.items, state.library?.bookmarks, state.library?.progress]
     .reduce((all, group) => all.concat(asArray(group)), []);
-  return candidates.find(item => item.id === id) || { id, title: `剧集 ${id}` };
+  // id 一律按字符串比：调用点传进来的是 dataset（恒为字符串），而 REST 适配层
+  // 的 item.id 可能还是数值，严格相等会永远 miss，标题退化成「剧集 N」兜底。
+  return candidates.find(item => String(item.id) === String(id)) || { id, title: `剧集 ${id}` };
 }
 
 function fetchDetail(id) {
@@ -541,7 +545,9 @@ function fetchDetail(id) {
 }
 
 async function goDetail(id, trigger) {
-  if (state.route === 'detail' && state.sourceItem?.id === id) {
+  // 同 sourceItem：dataset 来的 id 是字符串，state.sourceItem.id 可能是数值，
+  // 严格相等会让「详情页原位重试」对数值 id 永远不命中。
+  if (state.route === 'detail' && String(state.sourceItem?.id ?? '') === String(id)) {
     // Retry in place; preserve the original source card and return destination.
     state.detailLoading = true; renderDetail();
     const token = ++routeToken;

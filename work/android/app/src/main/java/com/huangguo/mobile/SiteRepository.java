@@ -16,6 +16,7 @@ import java.util.Locale;
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
@@ -81,6 +82,80 @@ final class SiteRepository {
         }
     }
 
+    /**
+     * C 档裸拉（方案 §4.1/§4.3）：名单外主机的试拉。
+     *
+     * <p>只带 {@code Referer: <源 origin>} —— Referer 本身不是秘密，防盗链
+     * 通常只认它；绝不带源 cookie / 源 UA。「能泄露的只有我们拉了这个地址」，凭据
+     * 不给就无从借道外传。走全局路由，不吃源钉死的 hosts/DoH。
+     * 超时不用这边传：AiiHttp 默认 8s 连接 / 15s 读取，与原来 15s 的意图一致。
+     *
+     * <p>返回**原始字节**，解密和验图由调用方流水线做 —— aes-cbc 源的封面是密文，
+     * 探测层看不懂也不该看懂；「算不算拉成功」由验图说了算，观测集的写入因此
+     * 放在验图之后（coverData 的 probe 分支）。
+     *
+     * <p>══════ 解析一次、钉死直连（堵 DNS rebinding）═══════
+     * 原来这里「{@code rejectPrivateNet} 自己解析校验一遍 → {@code getRaw} 里
+     * 再独立解析一遍」，两次解析之间权威 DNS 可以换答案：校验时是公网地址、
+     * 连接时已被换到内网 —— 校验等于白做（TOCTOU）。现在解析只做一次，
+     * 校验过的那份地址原样钉给 {@code AiiHttp.getRawPinned} 按地址直连，
+     * 「校验的」和「连的」强制是同一份答案。上游失败**不回退**到会二次解析的
+     * getRaw —— 宁可报错，也不把校验过的地址换成一份没校验过的。
+     */
+    private byte[] probeBare(SiteProfile.CoverTarget target) throws Exception {
+        java.net.InetAddress[] addrs;
+        try {
+            addrs = java.net.InetAddress.getAllByName(target.host);
+        } catch (Throwable resolveError) {
+            throw new java.io.IOException("封面主机解析失败（" + target.host + "）：" + AiiHttp.describe(resolveError));
+        }
+        rejectPrivateAddrs(target.host, addrs);
+        // 防盗链探测的 Referer 经 extraHeaders 传回；源没配 origin 就裸发，不硬造。
+        java.util.Map<String, String> headers = new java.util.LinkedHashMap<String, String>();
+        if (!this.profile.origin.isEmpty()) {
+            headers.put("Referer", this.profile.origin + "/");
+        }
+        // 只钉地址、不换路、不重试：连不上就报错，回退 getRaw 等于重新解析一遍。
+        return AiiHttp.getRawPinned(target.uri.toString(), headers, addrs);
+    }
+
+    /**
+     * 私网拒绝（方案 §4.3）：对**已经解析好**的地址列表逐个判内网。
+     *
+     * 字面 IP 在 {@link SiteProfile#rejectHard} 就被拒了，这里堵的是「公网域名
+     * 解析到内网」的 DNS rebinding 变体 —— 裸拉不带凭据，但也不该被人借道探测内网。
+     * 入参收地址列表而不是主机名：解析只做一次（probeBare），校验和连接用的
+     * 必须是同一份答案 —— 要是这里再查一次 DNS，两次之间换了答案校验就白做了。
+     */
+    private static void rejectPrivateAddrs(String host, java.net.InetAddress[] addrs) throws Exception {
+        if (addrs == null || addrs.length == 0) {
+            throw new java.io.IOException("封面主机没有解析结果（" + host + "）");
+        }
+        for (java.net.InetAddress addr : addrs) {
+            boolean bad = addr.isSiteLocalAddress() || addr.isLoopbackAddress()
+                    || addr.isLinkLocalAddress() || addr.isAnyLocalAddress()
+                    || addr.isMulticastAddress();
+            if (!bad && addr instanceof java.net.Inet6Address) {
+                // fc00::/7（unique local）isSiteLocalAddress 不认 —— 它看的是废弃的 fec0::/10。
+                byte first = addr.getAddress()[0];
+                bad = (first & 0xFE) == 0xFC;
+            }
+            if (bad) {
+                throw new java.io.IOException("封面主机解析到内网地址（" + host + " → "
+                        + addr.getHostAddress() + "），拒绝裸拉");
+            }
+        }
+    }
+
+    /** 首次进观测集的上报（方案 §4.2）。服务端据此看轮换族，不用人翻日志。 */
+    private void reportHostTrusted(String host) {
+        try {
+            Report.event("cover", "cover_host_trusted", new JSONObject().put("host", host));
+        } catch (Throwable ignored) {
+            // 上报永远不挡出图。
+        }
+    }
+
     // ── 封面失败的负缓存 ────────────────────────────────────────────────
     //
     // 前台滚动时会不停重试同一张封面（cover.js 每 30 秒一次、且列表重绘又会问）。
@@ -111,6 +186,14 @@ final class SiteRepository {
     /** 主机级：key = 主机名（小写）。值只用来判断「这个主机刚失败过」，消息不共用。 */
     private static final java.util.Map<String, Long> FAILED_HOSTS =
             new java.util.concurrent.ConcurrentHashMap<String, Long>();
+
+    // ── 诊断 ring：灰块要能被归因（方案 §4.5）──────────────────────────
+    // 负缓存把失败合并了、Report.Once 把上报挡了 —— 都是对的，但代价是
+    // 「此刻为什么没封面」没人答得上来。这个 ring 是给「封面诊断」页看的
+    // 本地记录，不上报：最近 20 条失败，什么时候、哪台主机、为什么。
+    private static final java.util.Deque<String> RECENT_FAILURES =
+            new java.util.concurrent.ConcurrentLinkedDeque<String>();
+    private static final int RECENT_FAILURES_MAX = 20;
 
     /** 缓存过的那条失败：消息和第一次一模一样，但重试时不再进上报。 */
     static final class CoverFailure extends IllegalStateException implements Report.Once {
@@ -143,6 +226,15 @@ final class SiteRepository {
                 FAILED_HOSTS.clear();
             }
             FAILED_HOSTS.put(host, System.currentTimeMillis() + hostTtlMs);
+        }
+        noteRecentFailure(message, host);
+    }
+
+    /** 诊断 ring 落一笔。时间戳放最前面，诊断页按它排新旧。 */
+    private static void noteRecentFailure(String message, String host) {
+        RECENT_FAILURES.addFirst(System.currentTimeMillis() + "\t" + message + "\t@" + host);
+        while (RECENT_FAILURES.size() > RECENT_FAILURES_MAX) {
+            RECENT_FAILURES.removeLast();
         }
     }
 
@@ -190,6 +282,29 @@ final class SiteRepository {
         FAILED_HOSTS.clear();
     }
 
+    // ── 给「封面诊断」（桥命令 cover-diag）看的两份快照 ─────────────────
+
+    /** 诊断：最近的封面失败（新在前，≤20 条），每条「时间戳\t消息\t@主机」。 */
+    static JSONArray recentCoverFailureDump() {
+        JSONArray out = new JSONArray();
+        for (String line : RECENT_FAILURES) {
+            out.put(line);
+        }
+        return out;
+    }
+
+    /** 诊断：还在冻结期内的主机（URL 级负缓存不在其列 —— 那是按地址的，量大且按 host 归因更直接）。 */
+    static JSONArray frozenCoverHostDump() throws org.json.JSONException {
+        long now = System.currentTimeMillis();
+        JSONArray out = new JSONArray();
+        for (java.util.Map.Entry<String, Long> e : FAILED_HOSTS.entrySet()) {
+            if (e.getValue() > now) {
+                out.put(new JSONObject().put("host", e.getKey()).put("until", e.getValue().longValue()));
+            }
+        }
+        return out;
+    }
+
     static void rememberHostFailureForTest(String host, long until) {
         FAILED_HOSTS.put(host.toLowerCase(Locale.ROOT), until);
     }
@@ -221,6 +336,31 @@ final class SiteRepository {
 
     /** 包可见：单测要盯住「签名剔了、业务参数留着」这两面。 */
     static String cacheKeyQuery(String rawQuery) {
+        return cacheKeyQuery(rawQuery, null);
+    }
+
+    /** query 串拆成参数表（参数名小写、保序）。null/空返回空表。给 CoverParamMemory 观测用。 */
+    static java.util.Map<String, String> parseQueryParams(String rawQuery) {
+        java.util.Map<String, String> out = new java.util.LinkedHashMap<String, String>();
+        if (rawQuery == null || rawQuery.length() == 0) return out;
+        for (String pair : rawQuery.split("&")) {
+            if (pair.length() == 0) continue;
+            int eq = pair.indexOf('=');
+            String name = (eq < 0 ? pair : pair.substring(0, eq)).toLowerCase(Locale.ROOT);
+            String value = eq < 0 ? "" : pair.substring(eq + 1);
+            if (!out.containsKey(name)) {
+                out.put(name, value);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 带自适应易变参数的重载（方案 §4.4）。{@code extraVolatile} 是
+     * {@link CoverParamMemory} 为这个 (源, path) 判出的易变参数，在种子名单之上
+     * 增量剔除。传 null 就是种子行为。
+     */
+    static String cacheKeyQuery(String rawQuery, java.util.Set<String> extraVolatile) {
         if (rawQuery == null || rawQuery.length() == 0) return "";
         StringBuilder sb = new StringBuilder();
         for (String pair : rawQuery.split("&")) {
@@ -228,6 +368,7 @@ final class SiteRepository {
             int eq = pair.indexOf('=');
             String name = (eq < 0 ? pair : pair.substring(0, eq)).toLowerCase(Locale.ROOT);
             if (SIGNATURE_PARAMS.contains(name)) continue;
+            if (extraVolatile != null && extraVolatile.contains(name)) continue;
             if (sb.length() > 0) sb.append('&');
             sb.append(pair);
         }
@@ -347,14 +488,15 @@ final class SiteRepository {
         if (hostCached != null) {
             throw hostCached;
         }
-        String strCoverUrl;
+        SiteProfile.CoverTarget target;
         try {
-            strCoverUrl = this.profile.coverUrl(str);
+            target = this.profile.coverTarget(str);
         } catch (IllegalArgumentException configError) {
             // 配置缺主机这类失败，重试一万次结果一样 —— 缓存住，别再刷上报。
             rememberFailure(str, configError.getMessage() == null ? "封面配置不合法" : configError.getMessage());
             throw configError;
         }
+        String strCoverUrl = target.uri.toString();
         URL url = new URL(strCoverUrl);
         String path = url.getPath();
         int dot = path.lastIndexOf(46);
@@ -374,14 +516,19 @@ final class SiteRepository {
         }
         // 缓存键把 query 也算进去：同路径不同参数的封面是两张不同的图，
         // 只 hash 到 path 会互相污染（?id=1 的图被 ?id=2 直接吃到缓存）。
-        // 但**签名参数不算**：见 cacheKeyQuery。
-        byte[] bArrDigest = MessageDigest.getInstance("SHA-256").digest((this.profile.fingerprint + ":" + url.getHost() + path + "?" + cacheKeyQuery(url.getQuery())).getBytes(StandardCharsets.UTF_8));
+        // 但**签名参数不算**：见 cacheKeyQuery。种子名单之外，自适应易变参数
+        // （CoverParamMemory）也在观测当场判、当场剔 —— 这次取值和上次不同，
+        // 键就不能再信它了，等下一张图才剔等于每轮换一次重下一遍。
+        CoverParamMemory.observe(this.appContext, this.profile.fingerprint, path, parseQueryParams(url.getQuery()));
+        byte[] bArrDigest = MessageDigest.getInstance("SHA-256").digest((this.profile.fingerprint + ":" + url.getHost() + path + "?" + cacheKeyQuery(url.getQuery(),
+                CoverParamMemory.volatileParams(this.appContext, this.profile.fingerprint, path))).getBytes(StandardCharsets.UTF_8));
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 16; i++) {
             sb.append(String.format("%02x", Integer.valueOf(bArrDigest[i] & 255)));
         }
         File file = new File(this.coverDir, ((Object) sb) + ".img");
         byte[] bArr = null;
+        boolean probed = false;
         if (file.isFile()) {
             byte[] allBytes = null;
             try {
@@ -419,8 +566,12 @@ final class SiteRepository {
         }
         if (bArr == null) {
             byte[] raw;
+            // C 档（名单外、观测集里也没有）：裸拉试一次（方案 §4.1/§4.3）。
+            // 判定放在缓存查过之后 —— 盘上还有这张图就别发探测请求。
+            boolean probe = target.tier == SiteProfile.CoverTier.UNKNOWN
+                    && !CoverTrustStore.isObserved(this.appContext, this.profile.fingerprint, target.host);
             try {
-                raw = fetchCover(strCoverUrl);
+                raw = probe ? probeBare(target) : fetchCover(strCoverUrl);
             } catch (Exception fetchError) {
                 // 抓不下来（超时、连接重置、图床回 4xx）就照原样抛 —— dispatch 会记一条。
                 // 同一条地址五分钟内再问，走上面的缓存，不再重复上报。
@@ -428,8 +579,12 @@ final class SiteRepository {
                 // 别让一次抖动把整页封面按死五分钟。
                 rememberFailure(str, fetchError.getMessage() == null ? "请求失败" : fetchError.getMessage(),
                         FAIL_HOST_NET_MS);
+                // B 档主机失败记一笔：连续 3 次降回 C 档重新裸拉验证。A/C 档没有
+                // 档案，这个调用是空操作 —— C 档的失败由上面的负缓存管。
+                CoverTrustStore.recordFail(this.appContext, this.profile.fingerprint, target.host);
                 throw fetchError;
             }
+            probed = probe;
             String strOptString = this.profile.object("cover").optString("mode");
             byte[] bArrFetch = raw;
             if ("aes-cbc".equals(strOptString) || (Text.TEXT_EMPHASIS_AUTO.equals(strOptString) && !validImage(bArrFetch))) {
@@ -447,6 +602,14 @@ final class SiteRepository {
                 throw new IllegalStateException(detail);
             }
             bArr = bArrFetch;
+            if (probe) {
+                // 裸拉 + 解密 + 验图全过了，这台主机才配进观测集 —— 信任由响应决定，
+                // 不是由「请求没抛异常」决定（图床回个错误页也算失败）。
+                boolean first = CoverTrustStore.record(this.appContext, this.profile.fingerprint, target.host);
+                if (first) {
+                    reportHostTrusted(target.host);
+                }
+            }
             FileOutputStream fileOutputStream2 = new FileOutputStream(file);
             try {
                 fileOutputStream2.write(bArr);
@@ -464,6 +627,11 @@ final class SiteRepository {
         // 拿到图了 —— 这一条和它主机上的失败记录都作废。放在这儿（读缓存命中与
         // 网络抓取两条路都汇到这点）是因为「成功」这个事实只在这里确定一次。
         forgetFailure(str);
+        // B 档主机的保鲜：成功刷新 lastSeenAt，TTL 就不会把还在干活的主机挤出去。
+        // 刚被裸拉提拔的那台不用再记 —— record() 自己已经记了 ok 和时间。
+        if (!probed) {
+            CoverTrustStore.recordOk(this.appContext, this.profile.fingerprint, target.host);
+        }
         byte b = bArr[0];
         if (b == -1) {
             str2 = Mime.IMAGE_JPEG;

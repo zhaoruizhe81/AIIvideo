@@ -39,6 +39,14 @@ public class SpiderService extends Service {
 
     private static final String TAG = "HG.Spider";
 
+    /**
+     * 回程应答的预检上限。Binder 事务缓冲约 1MB（进程内所有在途事务共享），
+     * 预序列化超过 700KB 就当场回一句明确错误，而不是让
+     * TransactionTooLargeException 从 binder 层裸抛出来 —— 那种异常主进程
+     * 只能看到类名，查起来不知道是请求大了还是结果大了。
+     */
+    private static final int MAX_REPLY_CHARS = 700 * 1024;
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -92,16 +100,35 @@ public class SpiderService extends Service {
                 SiteFetchWebView.setProxyHint(req.optString("effectiveProxy", ""));
                 // 主进程过好的盾搬进来（见 SiteFetchWebView.cookieHint 的注释）。
                 SiteFetchWebView.setCookieHint(req.optString("cookieHint", ""));
+                // 源码按「路径 + 大小 + 修改时间」在本进程自读（SpiderStore
+                // .readInstalledSource）：全量传 js 会撞 Binder 事务上限，指纹对不上
+                // 的话说明文件在门禁扫描之后被换过，直接报错不给执行。
+                final String source = SpiderStore.readInstalledSource(
+                        getApplicationContext(),
+                        req.optString("sourcePath", ""),
+                        req.optLong("sourceBytes", -1),
+                        req.optLong("sourceMtime", -1));
                 final JSONObject payload = SpiderRuntime.call(
                         getApplicationContext(),
-                        req.optString("source", ""),
+                        source,
                         req.optString("cap", ""),
                         new JSONObject(req.optString("args", "{}")),
                         req.optInt("timeoutMs", 15_000));
-                return new JSONObject()
+                final String reply = new JSONObject()
                         .put("ok", true)
                         .put("payload", payload)
                         .toString();
+                if (reply.length() > MAX_REPLY_CHARS) {
+                    Log.w(TAG, "spider 结果太大带不回去：" + (reply.length() / 1024)
+                            + "KB > " + (MAX_REPLY_CHARS / 1024) + "KB");
+                    return new JSONObject()
+                            .put("ok", false)
+                            .put("error", "spider 返回的结果太大（" + (reply.length() / 1024)
+                                    + "KB），超过跨进程传输上限（" + (MAX_REPLY_CHARS / 1024)
+                                    + "KB），请让源减少一次返回的数据量。")
+                            .toString();
+                }
+                return reply;
             } catch (ShieldSignal e) {
                 // 盾后站点 headless 过不去（挑战要真窗口，clearance 也没有或失效）。
                 // 应答带上被挡地址，主进程 SpiderClient 抛 ShieldSignal，bridge 命令层

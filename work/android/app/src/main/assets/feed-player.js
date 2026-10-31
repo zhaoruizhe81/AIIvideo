@@ -14,6 +14,7 @@
   // 现在两条一起上：TTL 收到 2 分钟，播放器报错时主动 urlForget。
   // 采集站的 m3u8 本来就活不长，长缓存省下的那点时间不值这个坑。
   const URL_TTL = 2 * 60 * 1000;
+  const PROGRESS_LIMIT = 300;   // 进度记忆的条数上限：这份数据只增不删，见 remember
   const HOLD_MS = 280;
   const PRELOAD_DISTANCE = 1;
   const KEEP_DISTANCE = 3;
@@ -31,6 +32,11 @@
     // 本窗口的亮度（0~1）。进播放器时问一次原生：窗口上没覆盖过就用系统亮度的
     // 估计值 —— 不这样的话第一次上下滑会从我们瞎猜的数起跳，屏幕先闪一下。
     let brightness = null;
+    // 打开内置播放器的代币与防重入锁。openAt 有三段 await（取详情 / 解析地址 /
+    // 唤起原生），中途用户可能按返回退出 —— 退出后剩下的流程绝不能把播放器
+    // 又拉起来。cleanup()/close() 作废当前代币；opening 挡双击连发的第二条链。
+    let openToken = 0;
+    let opening = false;
 
     const {
       state, content, api, asArray, esc, icon, toast, readCache,
@@ -204,8 +210,19 @@
       try {
         const all = storeAll();
         all[videoId] = { ep, time, dur, at: Date.now() };
+        // 只留最近 300 条。这份数据原本只增不删，攒到 localStorage 配额爆掉之后
+        // setItem 会永远抛错、进度从此静默不存 —— 裁剪跟 urlRemember 同一套写法。
+        const keys = Object.keys(all);
+        if (keys.length > PROGRESS_LIMIT) {
+          keys.sort((a, b) => (all[a].at || 0) - (all[b].at || 0))
+            .slice(0, keys.length - PROGRESS_LIMIT)
+            .forEach(key => { delete all[key]; });
+        }
         localStorage.setItem(STORE_KEY, JSON.stringify(all));
-      } catch (error) {}
+      } catch (error) {
+        // 写不进去（多半是配额）必须留痕，不然「进度怎么没了」无从查起。
+        console.warn('[feed] 进度保存失败：' + (error && error.message ? error.message : error));
+      }
     }
 
     // 自动同步的防抖定时器。
@@ -294,6 +311,7 @@
       observer = null;
       activePage = null;
       currentFeed = null;
+      openToken++;      // 有打开流程（openAt）在路上就作废它，见 alive()
       const feed = document.querySelector('.feed');
       if (feed) {
         feed.querySelectorAll('.feed-page video').forEach(video => {
@@ -311,6 +329,9 @@
       // 返回键吃掉了。
       const hadFeed = !!document.querySelector('.feed');
       if (hadFeed) cleanup();
+      // boot 屏（还没有 .feed 元素）时上面那句不会跑，代币在这里也要作废 ——
+      // 不然返回之后解析完成，播放器还是会自己弹出来。
+      openToken++;
       // 离开播放器把亮度交回系统 —— 播放器里调暗是为了看片，退出之后还黑着
       // 就成了「这个 App 把我的屏幕调暗了」。
       playerCommand?.('brightness?value=-1').catch(() => {});
@@ -385,29 +406,43 @@
       cleanup();
       state.route = 'feed';
       state.feedReturnId = id;
-      const boot = text => { content.innerHTML = '<div class="feed-boot">' + esc(text) + '</div>'; };
+      // 代币守卫：下面有三段 await（取详情 / 解析地址 / 唤起原生），任何一段的
+      // 途中用户都可能按返回退出（close 拨回详情页）。退出了就绝不能在 await
+      // 落定后把原生播放器又拉起来。cleanup()/close() 会作废这里的代币。
+      const token = ++openToken;
+      const alive = () => token === openToken && state.route === 'feed';
+      const boot = text => {
+        if (!alive()) return;   // 解析中的进度文字同理：退出后别再往 content 里写
+        content.innerHTML = '<div class="feed-boot">' + esc(text) + '</div>';
+      };
       boot('正在打开播放器…');
 
       let detail = (state.detail && String(state.detail.id) === id && asArray(state.detail.episodes).length)
         ? state.detail : null;
       if (!detail) {
         try { detail = await api('detail', { id }); }
-        catch (error) { boot(error.message || '加载失败'); return; }
+        catch (error) { if (alive()) boot(error.message || '加载失败'); return; }
       }
+      if (!alive()) return;
       const episodes = asArray(detail.episodes)
         .map(entry => Number(entry.number ?? entry.episode ?? entry.ep ?? 0))
         .filter(Boolean);
-      if (!episodes.length) { boot('这部剧还没有可播放的选集'); return; }
+      if (!episodes.length) { if (alive()) boot('这部剧还没有可播放的选集'); return; }
 
-      const ep = Number(episode) || episodes[0];
-      const index = Math.max(0, episodes.indexOf(ep));
+      let ep = Number(episode) || episodes[0];
+      // 记忆里的集数可能已经不在这部剧里（下架、换源后选集变了）。index 退到 0
+      // 的同时 episode 也得跟着归一 —— 不然原生按 index 高亮第 1 集，却按 episode
+      // 去取旧集数的流、记旧集数的进度，两边对不上。
+      if (episodes.indexOf(ep) < 0) ep = episodes[0];
+      const index = episodes.indexOf(ep);
       const memory = recall(id);
       const start = (memory && Number(memory.ep) === ep && memory.time > 5)
         ? Math.round(memory.time * 1000) : 0;
 
       let resolved;
       try { resolved = await resolveUrl(id, ep, boot); }
-      catch (error) { boot(error.message || '取不到播放地址'); return; }
+      catch (error) { if (alive()) boot(error.message || '取不到播放地址'); return; }
+      if (!alive()) return;
       const url = resolved.url;
       const lines = Array.isArray(resolved.lines) ? resolved.lines : [];
 
@@ -438,20 +473,27 @@
       };
       try {
         const reply = await window.HG_PLAYER.command('native?payload=' + encodeURIComponent(JSON.stringify(payload)));
+        if (!alive()) return;
         if (reply && reply.fallback) boot('这个安装包没有带本机架构的解码库（需要 arm64-v8a）');
       } catch (error) {
-        boot(error.message || '内置播放器打不开');
+        if (alive()) boot(error.message || '内置播放器打不开');
       }
     }
 
     function open(videoId, episode) {
       const id = videoId ?? state.detail?.id ?? state.sourceItem?.id;
       if (id == null) { toast('缺少剧集信息', true); return; }
+      // 防重入：上一次打开还在解析中（取详情 / wasm 解密最长十几秒）就不再起
+      // 第二条 —— 双击「立即播放」本来会对原生连发两次 native?payload=。
+      if (opening) return;
       primeBrightness();
       const memory = recall(String(id));
       const explicit = episode != null && Number(episode) > 0;
       const ep = explicit ? Number(episode) : (memory ? memory.ep : 1);
-      openAt(String(id), Math.max(1, ep)).catch(error => toast(error.message || '播放失败，请重试', true));
+      opening = true;
+      openAt(String(id), Math.max(1, ep))
+        .catch(error => toast(error.message || '播放失败，请重试', true))
+        .then(() => { opening = false; });
     }
 
     function bindVideo(page) {

@@ -11,14 +11,14 @@ cd work/android
 ./gradlew :app:assembleRelease      # 出 app-arm64-v8a-release.apk（2026-10-31 的 2.0.28 实测 39.1 MB）
 ./gradlew :app:assembleDebug        # debug 包
 ./gradlew :app:compileDebugJavaWithJavac   # 只验编译，秒级
-./gradlew :app:testDebugUnitTest           # 单元测试，236 个用例
+./gradlew :app:testDebugUnitTest           # 单元测试，350 个用例
 ```
 
 或者用脚本（推荐，日志更清楚）：
 
 ```bash
 ./scripts/build.sh check      # 编译 + 资源 + assets
-./scripts/build.sh test       # 236 个单元测试
+./scripts/build.sh test       # 312 个单元测试
 ./scripts/build.sh build      # 出 release APK
 ./scripts/build.sh install    # 构建 → 装真机 → 冷启动 → 截图
 ./scripts/build.sh verify     # 清空重建 + 测试 + 断言 APK 内容
@@ -152,17 +152,18 @@ private final Map<String, Command> commands = new HashMap<>();
 `dispatch()` 从 429 行缩到 33 行。加指令只需要在 `registerCommands()` 里加一行
 `commands.put("名字", args -> {...})`。
 
-**40 条指令**：app-version / hot-ready / open-player / episode / cached / detail /
-check-update / account / apply-hot-update / logout / newest / recommend /
-clear-bookmarks / search / download-update / tag-list / change-password / register /
-home / quit / sync / tags / category / cover / login / theme / window-insets /
-library / confirm-age / clear-content-cache / cached-update / check-hot-update /
-clear-history / age-status / bookmark-state / hot-update-status / get-progress /
-choose-avatar / screen-corners / bookmark
+**39 条指令**（2026-10-31 实数）：account / app-version / apply-hot-update /
+bookmark / bookmark-state / cached / cached-update / change-password /
+check-hot-update / check-update / choose-avatar / clear-bookmarks /
+clear-content-cache / clear-history / cover / cover-diag / detail / diag /
+download-update / get-progress / hot-ready / hot-update-status / http / library /
+login / logout / open-player / player / progress / proxy / quit / register /
+report / screen-corners / source / spider / sync / theme / window-insets
 
 四个 `content-*` 指令（content-status / enter-private / confirm-private-age /
 leave-private）**故意留在 `dispatch()` 方法里**，不进注册表——它们必须在
 `contentMode.require()` 校验之前执行，否则切换内容源时会先被门禁拦住。
+（双态拆掉后这条门禁只剩历史意义，但守规矩的写法留着。）
 
 `services()` 每次取 `repository` / `store` / `account` 的当前快照。原代码是在 switch
 之前用 `synchronized(this)` 一次性抓三个引用，因为 `rebindContent()` 会整体替换它们。
@@ -170,7 +171,7 @@ leave-private）**故意留在 `dispatch()` 方法里**，不进注册表——�
 
 ### 验证方法（可复用）
 
-真机上跑通 40 条指令，不靠肉眼看界面：
+真机上跑通全部指令，不靠肉眼看界面：
 
 ```bash
 # 1. 开 WebView 调试（发布版也开着：setWebContentsDebuggingEnabled(true)，见 MainActivity:155）
@@ -184,13 +185,16 @@ curl -s http://127.0.0.1:9222/json   # 取 webSocketDebuggerUrl
 完整的配方（含 Python 客户端、`awaitPromise`、往页面里塞长文本的办法）在
 [`docs/真机WebView调试.md`](../../docs/真机WebView调试.md)。
 
-判定标准：logcat 里 `未知请求` 出现 **0 次** = 40 条全部被注册表接住。
+判定标准：logcat 里 `未知请求` 出现 **0 次** = 全部指令被注册表接住。
 出现 `xxx failed` 是业务失败（没配源、没登录、参数不全），不是路由错误。
 
 ## 测试
 
-236 个 JUnit 用例（2026-10-21，26 个测试类），全部在 JVM 上跑，不需要设备，秒级。
+350 个 JUnit 用例（2026-10-31，41 个测试类），全部在 JVM 上跑，不需要设备，秒级。
 其中 30 个默认跳过：联网用例要加 `-Dhg.live=1` 才跑，fixture 用例缺快照也跳过。
+（2026-10-31 晚起 +3 类：`CoverTrustStoreTest` 观测集生命周期、`CoverTierTest`
+信任三档与硬地板、`CoverParamMemoryTest` 自适应缓存键 —— 封面信任模型改造的
+配套，见 `docs/history/2026-10-31-封面信任模型改造方案.md`。）
 
 | 测试类 | 用例 | 测什么 |
 |---|---|---|

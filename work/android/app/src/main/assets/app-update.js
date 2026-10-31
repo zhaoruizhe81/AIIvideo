@@ -36,7 +36,28 @@ function restoreUpdatePhase() {
     }
     updateCheck.phase = 'downloading';
     updateCheck.progress = Number(saved.progress) || 0;
+    // 进程被杀后恢复的下载态，原生那头多半已经死了：挂个看门狗，到点没动静
+    // 就回 idle，不然这根进度条没有任何出口（按钮全被 downloading 态藏掉）。
+    scheduleUpdatePhaseExpiry();
   } catch (error) {}
+}
+
+// 下载态看门狗。10 分钟内没有一次进度回调（hgUpdateProgress 会刷 updateSpeed.at）
+// 就把 phase 拨回 idle 并清掉持久化状态；还有活进度就再挂一轮 —— 真机走慢镜像
+// 下载要十几分钟，不能一刀切按恢复时刻计时。原生侧的失败走 hgUpdateFailed，
+// 到不了这里。
+function scheduleUpdatePhaseExpiry() {
+  setTimeout(() => {
+    if (updateCheck.phase !== 'downloading') return;
+    if (updateSpeed.at && Date.now() - updateSpeed.at < 600000) {
+      scheduleUpdatePhaseExpiry();
+      return;
+    }
+    updateCheck.phase = 'idle';
+    updateCheck.progress = 0;
+    try { localStorage.removeItem(UPDATE_STATE_KEY); } catch (error) {}
+    renderUpdateCheck();
+  }, 600000);
 }
 restoreUpdatePhase();
 
@@ -115,11 +136,22 @@ async function downloadAppUpdate() {
   updateSpeed.pct = null; updateSpeed.at = 0; updateSpeed.bps = 0;
   updateCheck.phase = 'downloading'; updateCheck.progress = 0; renderUpdateCheck();
   rememberUpdatePhase();
+  // 桥调用不限时之后，发起这条请求就是界面唯一的超时兜底：请求丢了、原生回调
+  // 丢了，都靠这个看门狗把 downloading 态收回来。
+  scheduleUpdatePhaseExpiry();
   try {
-    await api('download-update');
-    updateCheck.progress = 100;
-    rememberUpdatePhase();
+    // 第三参 0 = 桥调用不限时：下载是分钟级操作，45 秒超时会把「还在下」误报成
+    // 失败。这条 Promise 的成败不等于下载的成败 —— 终态只由 hgUpdateProgress(100) /
+    // hgUpdateFailed / 安装环节钩子驱动，这里 resolve 时什么都不改。
+    await api('download-update', {}, 0);
   } catch (error) {
+    if (error && error.message === '已有更新在下载中') {
+      // 原生已经有一个下载在跑（多半是页面重建后状态丢了才点的）：接回那条下载，
+      // 进度条和 localStorage 状态都留着，别当成失败。
+      updateCheck.phase = 'downloading';
+      renderUpdateCheck();
+      return;
+    }
     updateCheck.phase = 'error'; updateCheck.message = error.message;
     try { localStorage.removeItem(UPDATE_STATE_KEY); } catch (ignore) {}
   }
@@ -149,7 +181,13 @@ function fmtLeft(sec) {
 }
 
 window.hgUpdateProgress = percent => {
-  if (updateCheck.phase !== 'downloading') updateCheck.phase = 'downloading';
+  // 100 只在原生 sha256 校验通过后才会推上来（UpdateMirror.download 末尾 emit），
+  // 它就是下载成功的终态：切出 downloading，别让进度条永远停在 100%。
+  if (percent >= 100) {
+    updateCheck.phase = 'ready';
+  } else if (updateCheck.phase !== 'downloading') {
+    updateCheck.phase = 'downloading';
+  }
   const now = Date.now();
   const size = Number(updateCheck.info?.size) || 0;
   if (updateSpeed.pct != null && size > 0) {

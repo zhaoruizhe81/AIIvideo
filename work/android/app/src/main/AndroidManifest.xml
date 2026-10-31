@@ -44,6 +44,7 @@
             android:name="com.huangguo.mobile.VlcPlayerActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
             android:exported="false"
+            android:launchMode="singleTask"
             android:screenOrientation="user"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"/>
 

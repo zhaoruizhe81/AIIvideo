@@ -6,10 +6,12 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.os.IBinder;
 import android.os.Looper;
+import android.util.Log;
 
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.util.Iterator;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -72,15 +74,28 @@ final class SpiderClient {
     private SpiderClient() {
     }
 
+    /** 回填表单页上限。盾后页面实测 200~400KB，512KB 装得下正常页、拦得住异常页。 */
+    private static final int MAX_SHIELD_PAGE_CHARS = 512 * 1024;
+
+    /**
+     * 回填表总量上限。Binder 事务缓冲约 1MB（进程内所有在途事务共享），请求必须
+     * 留足余量 —— 顶部还有 cap/cookieHint/代理串，总量按 700KB 封顶。
+     */
+    private static final int MAX_SHIELD_TOTAL_CHARS = 700 * 1024;
+
     /**
      * 执行一次能力调用。<b>后台线程调用</b>。
+     *
+     * <p>源码不再全量过 Binder：只传「路径 + 大小 + 修改时间」，:spider 进程按
+     * 路径自读（{@link SpiderStore#readInstalledSource}）。2MB 的源全量传会撞
+     * TransactionTooLargeException（事务缓冲约 1MB），装得进却永远调不动。
      *
      * @return spider 的 payload（契约 §三）
      * @throws IOException 排队超时、被新请求取代、绑定失败、远端报错 —— message
      *                     都是能直接给用户/日志看的那一句
      */
-    static JSONObject call(Context ctx, String source, String cap,
-                            JSONObject args, int timeoutMs) throws Exception {
+    static JSONObject call(Context ctx, String sourcePath, long sourceBytes, long sourceMtime,
+                            String cap, JSONObject args, int timeoutMs) throws Exception {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             throw new IllegalStateException("SpiderClient.call 必须在后台线程调用。");
         }
@@ -96,9 +111,12 @@ final class SpiderClient {
             }
             final ISpiderChannel ch = channelOf(ctx, budget);
             final JSONObject req = new JSONObject()
-                    .put("source", source)
+                    // 源码只带指纹三件套，见方法注释。
+                    .put("sourcePath", sourcePath)
+                    .put("sourceBytes", sourceBytes)
+                    .put("sourceMtime", sourceMtime)
                     .put("cap", cap)
-                    .put("args", args == null ? new JSONObject() : args)
+                    .put("args", shieldPagesCapped(args))
                     .put("timeoutMs", budget)
                     // 代理快照。内置核心的地址只在主进程内存里，必须显式带过去；
                     // mode 也带上，服务侧用它对齐「用户按了直连」这类全局开关。
@@ -143,6 +161,47 @@ final class SpiderClient {
         }
     }
 
+    /**
+     * 回填表瘦身：单页超限、或累计超限的页直接丢掉（不进这次请求）。
+     *
+     * <p>一张超大页面把请求顶过 Binder 上限的话，整次盾后重试会以
+     * TransactionTooLargeException 收场 —— 比「这一页走不了回填」糟糕得多。
+     * 只瘦身发往子进程的这份拷贝，调用方手里的 args 不动。
+     */
+    private static JSONObject shieldPagesCapped(JSONObject args) throws Exception {
+        if (args == null) return new JSONObject();
+        final JSONObject pages = args.optJSONObject(SpiderRuntime.ARG_SHIELD_PAGES);
+        if (pages == null || pages.length() == 0) return args;
+        final JSONObject out = new JSONObject();
+        final Iterator<String> keys = args.keys();
+        while (keys.hasNext()) {
+            String k = keys.next();
+            if (!SpiderRuntime.ARG_SHIELD_PAGES.equals(k)) {
+                out.put(k, args.opt(k));
+            }
+        }
+        final JSONObject capped = new JSONObject();
+        int total = 0;
+        final Iterator<String> it = pages.keys();
+        while (it.hasNext()) {
+            final String url = it.next();
+            final String body = pages.optString(url, "");
+            if (body.length() > MAX_SHIELD_PAGE_CHARS) {
+                Log.w(TAG, "盾后回填页太大，丢弃（" + body.length() + " > "
+                        + MAX_SHIELD_PAGE_CHARS + " 字符）：" + url);
+                continue;
+            }
+            if (total + body.length() > MAX_SHIELD_TOTAL_CHARS) {
+                Log.w(TAG, "盾后回填总量到顶，丢弃余页（已收 " + total + " 字符）：" + url);
+                continue;
+            }
+            capped.put(url, body);
+            total += body.length();
+        }
+        out.put(SpiderRuntime.ARG_SHIELD_PAGES, capped);
+        return out;
+    }
+
     /** 当前源是不是盾后站点；是就顺手把主进程的 clearance 取出来。 */
     private static String cookieHintFor(Context ctx) {
         try {
@@ -183,7 +242,10 @@ final class SpiderClient {
             try {
                 appContext.unbindService(c);
                 appContext.stopService(new Intent(appContext, SpiderService.class));
-            } catch (Throwable ignored) {
+            } catch (Throwable e) {
+                // 解绑/停服务失败不拦 shutdown，但也不能一声不吭 —— 那会让「服务
+                // 没停干净、进程常驻」这类问题查无实据。
+                Log.w(TAG, "spider 服务解绑失败（忽略）：" + e);
             }
         }
     }
@@ -245,7 +307,8 @@ final class SpiderClient {
                 if (connection != null && appContext != null) {
                     try {
                         appContext.unbindService(connection);
-                    } catch (Throwable ignored) {
+                    } catch (Throwable e) {
+                        Log.w(TAG, "断连后解绑旧注册失败（忽略）：" + e);
                     }
                 }
                 connection = null;
@@ -268,7 +331,8 @@ final class SpiderClient {
                 if (connection != null && appContext != null) {
                     try {
                         appContext.unbindService(connection);
-                    } catch (Throwable ignored) {
+                    } catch (Throwable e) {
+                        Log.w(TAG, "binder 死亡后解绑旧注册失败（忽略）：" + e);
                     }
                 }
                 connection = null;
@@ -281,8 +345,12 @@ final class SpiderClient {
         bindRefused = false;
         if (!app.bindService(intent, connection, Context.BIND_AUTO_CREATE)) {
             // 绑定请求本身被拒（多为进程处于错误状态）：把闩锁放开，让上面的
-            // channelOf 抛「绑定失败」而不是干等到超时。
+            // channelOf 抛「绑定失败」而不是干等到超时。连接状态也要一并复位 ——
+            // bindAttempted/connection 不复位的话，bind() 开头的守卫会永远早退，
+            // 之后每次调用都报同一句「被拒」，系统缓过来也没有重试的机会。
             bindRefused = true;
+            connection = null;
+            bindAttempted = false;
             bound.countDown();
         }
     }

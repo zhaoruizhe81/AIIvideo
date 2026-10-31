@@ -661,6 +661,9 @@ final class SourceConfig {
             while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
             return new JSONObject(new String(out.toByteArray(), "UTF-8"));
         } catch (Exception e) {
+            // 坏了的清单/缓存文件会在下一次 remember()/note() 里被静默重写掉，
+            // 现在不留一句话，损坏现场就再也找不回来了。
+            UserSource.log("JSON 读不出来（" + target.getName() + "）：" + e);
             return null;
         } finally {
             UserSource.close(in);
@@ -836,6 +839,11 @@ final class SourceConfig {
         // 进程不死（重启走的是 Activity.recreate），预热结果和连接池都是 static，
         // 不作废的话下一条源会拿到上一条源的字节。和 __source:clear 同一个理由。
         AiiHttp.resetForSourceChange();
+        // 封面的静态态一并走：负缓存（static Map）+ 观测集/参数记忆的静态内存层
+        //（它们落盘的那份由下面 clearPreferences 目录遍历顺带清）。
+        SiteRepository.resetCoverFailureCache();
+        CoverTrustStore.resetAll(context);
+        CoverParamMemory.resetAll(context);
 
         // ② 网络代理。setProxy 同时把两个 OkHttp 客户端置空，下一次请求按直连重建。
         String proxyProblem = AiiHttp.setProxy("");
@@ -861,6 +869,13 @@ final class SourceConfig {
         //    不删的话换个人登录还能在相册里翻出上一个用户的脸。
         emptyDir(new File(context.getFilesDir(), "avatars"), failed);
 
+        // ④' 源配置缓存与用户装的 spider。config 和清单都清了，它们没有留下的理由：
+        //    source-cache 留着，「use」那条缓存捷径还会吃到重置前的旧文件；
+        //    spiders 留着，ensureSpider 看到「已装过」就跳过重下，用的还是旧 js。
+        //    都和「这台设备该和刚装完一样」矛盾。
+        emptyDir(new File(context.getFilesDir(), CACHE_DIR), failed);
+        emptyDir(new File(context.getFilesDir(), "spiders"), failed);
+
         // ⑤ 缓存目录。封面的解码结果、接口响应缓存、WebView 的 HTTP 缓存，
         //    以及 ParseKeyValueCache（SDK 把「当前登录用户」写在这里）。
         emptyDir(context.getCacheDir(), failed);
@@ -880,6 +895,21 @@ final class SourceConfig {
         out.put("prefs", prefs);
         out.put("failed", notes);
         return out;
+    }
+
+    /**
+     * 换源/清源时的封面侧清理：旧源的观测集、参数记忆、负缓存一起作废。
+     *
+     * <p>{@code oldProfile} 是换之前的 profile（此刻还没被新配置顶掉），用它拿
+     * 旧指纹定点清。观测集与参数记忆是按指纹隔离的，别的源（源清单里可以存
+     * 好几条）的记录不动 —— 切回去时观测集还在，不用重新裸拉。
+     */
+    private static void resetCoverCaches(Context context, SiteProfile oldProfile) {
+        SiteRepository.resetCoverFailureCache();
+        if (oldProfile != null) {
+            CoverTrustStore.reset(context, oldProfile.fingerprint);
+            CoverParamMemory.reset(context, oldProfile.fingerprint);
+        }
     }
     /**
      * 清掉这个应用的全部 SharedPreferences，返回清了几份。
@@ -1048,6 +1078,10 @@ final class SourceConfig {
                 // 配置没了，进程里那份预热/连接池也得跟着走 —— 否则下次配了别的源，
                 // 首页可能拿到「清空之前那个源」的字节。
                 AiiHttp.resetForSourceChange();
+                // 封面观测集/参数记忆按源隔离，旧源的记录跟着旧源走；
+                // 负缓存是 static 的（跨 Activity 存活），换源不清会拿旧源的主机
+                // 冻结记录拦新源的封面。
+                resetCoverCaches(context, profile);
                 UserSource.log("已清除用户源");
                 out.put("ok", true);
                 out.put("configured", false);
@@ -1100,6 +1134,9 @@ final class SourceConfig {
                 // 换源只重建 Activity，**进程不死** —— 而预热结果和连接池都是 static，
                 // 不清的话新源会拿到旧源的首页字节（实测：切完直接弹「内容更新失败」）。
                 AiiHttp.resetForSourceChange();
+                // 同 clear：旧源的封面观测集/参数记忆/负缓存不能带进新源
+                //（profile 此刻还是换之前的那个，指纹正好用来定点清）。
+                resetCoverCaches(context, profile);
                 // 内置核心的分流表也是「启动时固化」的（XrayConfig.buildString 抄的是
                 // 那一刻的 NetRoute.declaredProxyHosts）。换源不重建它，就会出现
                 // 「App 判代理、核心判直连」各走各的 —— 2026-10-20 黄果 62 秒超时
@@ -1214,9 +1251,19 @@ final class SourceConfig {
 
             if ("forget".equals(action)) {
                 if (url.length() == 0) return UserSource.fail(out, "没有提供源地址");
+                // 删的是不是当前生效的那个，要在 forget 之前判 —— 它删完就没得判了。
+                boolean wasActive = url.equals(activeUrl(context));
                 forget(context, url);
+                if (wasActive) {
+                    // 当前源没了，进程里那份预热/连接池和封面侧状态也得跟着走，
+                    // 和 clear/set 同一个理由（那两条都做，这里原来漏了）。
+                    AiiHttp.resetForSourceChange();
+                    resetCoverCaches(context, profile);
+                }
                 out.put("ok", true);
-                out.put("active", read(context) == null ? "" : url);
+                // 应答里的 active 是「删完之后谁在生效」，永远答真实值 ——
+                // 原来删的不是当前源时会把刚删的那个 url 当 active 报出去。
+                out.put("active", activeUrl(context));
                 return out;
             }
 

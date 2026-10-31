@@ -60,18 +60,21 @@ function track(kind, name, props) {
   } catch (ignored) {}
 }
 
-function bridgeCall(action, args = {}) {
+// timeoutMs：本次调用的等待上限（毫秒）。传 0 = 不限时（下载更新要跑几分钟）；
+// 缺省或非法值回落 BRIDGE_TIMEOUT_MS。
+function bridgeCall(action, args = {}, timeoutMs) {
   return new Promise((resolve, reject) => {
     const id = bridgeInstance + ':' + (++requestNumber);
-    const timer = setTimeout(() => {
+    const budget = timeoutMs === 0 ? 0 : (Number(timeoutMs) > 0 ? Number(timeoutMs) : BRIDGE_TIMEOUT_MS);
+    const timer = budget > 0 ? setTimeout(() => {
       if (!callbacks.has(id)) return;
       callbacks.delete(id);
       reject(new Error('请求超时（' + action + '）'));
-    }, BRIDGE_TIMEOUT_MS);
-    const finish = fn => value => { clearTimeout(timer); fn(value); };
+    }, budget) : null;
+    const finish = fn => value => { if (timer) clearTimeout(timer); fn(value); };
     callbacks.set(id, { resolve: finish(resolve), reject: finish(reject) });
     try { AndroidHost.request(id, action, JSON.stringify({ ...args, source: contentSource })); }
-    catch (error) { clearTimeout(timer); callbacks.delete(id); reject(error); }
+    catch (error) { if (timer) clearTimeout(timer); callbacks.delete(id); reject(error); }
   });
 }
 // 播放层（hxm/http.js）要用同一条桥。它是本模块作用域里的东西，得显式挂出去。
@@ -164,6 +167,14 @@ function nativePlayerInfo() {
 //      原生每 0.8 秒问一次，靠这张表把「正在解」和「解出来了」区分开。
 window.__hgNativeEps = window.__hgNativeEps || {};
 window.__hgNativeEpsBusy = window.__hgNativeEpsBusy || {};
+// 解析失败的负缓存（key → 失败时刻）。原生每 0.8 秒轮询一次 __hgNativeEpisode，
+// 失败不记的话一个坏源会在播放页开着期间被全量重解析（桥 + spider + 网络）到天荒地老。
+window.__hgNativeEpsFailed = window.__hgNativeEpsFailed || {};
+
+/** epurl 落盘缓存的有效期：签名地址按 8 分钟算，过期就重新解析。 */
+const EPURL_TTL_MS = 8 * 60 * 1000;
+/** 解析失败后的冷却期：期内 __hgNativeEpisode 不再触发新的解析。 */
+const RESOLVE_FAIL_TTL_MS = 45000;
 
 function hgNativeEpKey(id, ep) { return id + ':' + ep; }
 
@@ -195,6 +206,7 @@ function trackPlayResolveError(stage, code, message) {
 function hgNativeResolve(id, ep) {
   const key = hgNativeEpKey(id, ep);
   if (window.__hgNativeEpsBusy[key]) return;   // 已经在解了，别重复打接口
+  if (Date.now() - (Number(window.__hgNativeEpsFailed[key]) || 0) < RESOLVE_FAIL_TTL_MS) return;   // 刚失败过，冷却期内不再打接口
   window.__hgNativeEpsBusy[key] = true;
   api('episode', { id, episode: ep }).then(info => {
     let url = info.source || info.url || '';
@@ -206,19 +218,28 @@ function hgNativeResolve(id, ep) {
     return Promise.resolve(resolveWasm).then(resolved => {
       if (!/^https?:\/\//.test(resolved)) {
         // 解析出来是空串或者不是 http(s)：以前这里静默 return，用户看到的是
-        // 一个永远转圈的播放页，后台一条痕迹都没有。
+        // 一个永远转圈的播放页，后台一条痕迹都没有。记一笔负缓存，别让 0.8 秒
+        // 的轮询把这条失败路径变成全量重解析的循环。
+        window.__hgNativeEpsFailed[key] = Date.now();
         trackPlayResolveError('resolve', 'empty-url',
           '解析结果不是 http(s) 地址：' + String(resolved == null ? '' : resolved).slice(0, 60));
         return;
       }
       window.__hgNativeEps[key] = resolved;
+      delete window.__hgNativeEpsFailed[key];   // 成功了就解除冷却
       try {
+        const now = Date.now();
         const all = JSON.parse(localStorage.getItem('hgpref:epurl') || '{}');
-        all[key] = { url: resolved, at: Date.now() };
+        all[key] = { url: resolved, at: now };
+        // 这份表只增不删会无限膨胀（读取处虽有 TTL 但从不清理），写一次顺手清一遍。
+        Object.keys(all).forEach(stale => {
+          if (now - ((all[stale] && all[stale].at) || 0) >= EPURL_TTL_MS) delete all[stale];
+        });
         localStorage.setItem('hgpref:epurl', JSON.stringify(all));
       } catch (error) {}
     });
   }).catch(error => {
+    window.__hgNativeEpsFailed[key] = Date.now();
     trackPlayResolveError('resolve', (error && error.name) || 'error',
       (error && error.message) || String(error));
   }).then(() => { delete window.__hgNativeEpsBusy[key]; });
@@ -230,7 +251,7 @@ window.__hgNativeEpisode = (id, ep) => {
   if (live) return live;
   try {
     const hit = JSON.parse(localStorage.getItem('hgpref:epurl') || '{}')[key];
-    if (hit && hit.url && Date.now() - (hit.at || 0) < 8 * 60 * 1000) {
+    if (hit && hit.url && Date.now() - (hit.at || 0) < EPURL_TTL_MS) {
       window.__hgNativeEps[key] = hit.url;
       return hit.url;
     }
@@ -475,9 +496,12 @@ async function spiderApi(action, args) {
   console.log('[spider-api] ' + action + ' → cap=' + cap + ' args=' + JSON.stringify(spiderArgs));
   let payload;
   try {
+    // timeoutMs 同时喂两头：args 里那份是原生 spider 宿主的预算，第三参是
+    // 前端 bridgeCall 的等待上限。只给原生不给前端的话，45 秒默认值会先把
+    // 慢调用 reject 掉，原生的 90 秒预算形同虚设。
     payload = await bridgeCall('spider', {
       op: 'call', id, cap, args: spiderArgs, timeoutMs: 90000
-    });
+    }, 90000);
   } catch (error) {
     // 能力没实现 → 先试兜底；兜不了再把原始错误翻译成人话抛出去。
     if (isMissingCapability(error)) {
@@ -623,7 +647,9 @@ function contentFallback(action, caps, args) {
   return null;
 }
 
-function api(action, args = {}) {
+// timeoutMs 只对接桥兜底的那两条路（account / library / 下载更新这类非内容动作），
+// spider 与 REST 路径有各自的预算，不透传。
+function api(action, args = {}, timeoutMs) {
   const run = async () => {
     // 源声明了 spider 就整条内容通路都走它，不再碰 /api 路径。
     // 这里的分支是**穷举**的：能接的进 spiderApi，接不住的内容动作直接抛，
@@ -646,7 +672,7 @@ function api(action, args = {}) {
       if (CONTENT_ACTIONS.has(action)) {
         throw new Error('这个源没有可用的 ' + action + ' 接口路径：检查 web.paths.' + action + '，或这次请求的参数是否齐全');
       }
-      return bridgeCall(action, args);
+      return bridgeCall(action, args, timeoutMs);
     }
     // REST 接口统一走 Java api-json 桥，避免 WebView 自动附带 Origin 请求头。
     if (shape.apiPathFor(action, args)) {
@@ -664,7 +690,7 @@ function api(action, args = {}) {
       // （分类 slug 查不到 cate_id、搜索没关键词…）。两种都得让人看懂该改哪儿。
       throw new Error('这个源没有可用的 ' + action + ' 接口路径：检查 web.paths.' + action + '，或这次请求的参数是否齐全');
     }
-    return bridgeCall(action, args);
+    return bridgeCall(action, args, timeoutMs);
   };
   return contentReady ? contentReady.then(run) : run();
 }
@@ -672,8 +698,8 @@ function api(action, args = {}) {
 const scroll = document.getElementById('scroll');
 const content = document.getElementById('content');
 // 封面模块（cover.js）。api 是函数声明会被提升，所以这里放在 content/scroll
-// 之后就能拿到三样依赖，不用往后挪。
-const cover = window.HGCover.create({ api, content, scroll });
+// 之后就能拿到三样依赖，不用往后挪。track 给灰块上报用（cover_placeholder）。
+const cover = window.HGCover.create({ api, content, scroll, track });
 // 站点接口的形状（adapters.js）：动作名 → REST 路径、响应 JSON → 内部结构。
 // 纯逻辑，不碰 DOM 也不发请求，所以只需要一个封面地址归一函数。
 const shape = window.HGShape.create({ resolveCoverUrl: cover.resolveUrl });
@@ -833,9 +859,18 @@ const subIndex = tab => state.sub[tab] || 0;
 function bridgeDirect(action, args = {}) {
   return new Promise((resolve, reject) => {
     const id = bridgeInstance + ':' + (++requestNumber);
-    callbacks.set(id, { resolve, reject });
+    // 这条路曾经没有超时：Java 侧回包一丢，contentReady 永不 settle，排它后面的
+    // 启动链（ensure → startHome，以及所有经 api() 的调用）全部挂死。超时就 reject，
+    // 让调用方的 catch 落到各自的兜底值（content-status 是 unlocked 的假状态）。
+    const timer = setTimeout(() => {
+      if (!callbacks.has(id)) return;
+      callbacks.delete(id);
+      reject(new Error('请求超时（' + action + '）'));
+    }, BRIDGE_TIMEOUT_MS);
+    const finish = fn => value => { clearTimeout(timer); fn(value); };
+    callbacks.set(id, { resolve: finish(resolve), reject: finish(reject) });
     try { AndroidHost.request(id, action, JSON.stringify({ ...args, source: 'hongguo' })); }
-    catch (error) { callbacks.delete(id); reject(error); }
+    catch (error) { clearTimeout(timer); callbacks.delete(id); reject(error); }
   });
 }
 contentReady = (async () => {
@@ -1310,9 +1345,10 @@ async function reconcileCards(items, onPatched) {
     const info = await spiderMetaOf(spiderId);
     if (info.caps.length && info.caps.indexOf('reconcile') < 0) return;
     try {
+      // 第三参同 spiderApi：前端等待上限与原生预算对齐到 90 秒（见那里的注释）。
       const payload = await bridgeCall('spider', {
         op: 'call', id: spiderId, cap: 'reconcile', args: { ids: missing }, timeoutMs: 90000
-      });
+      }, 90000);
       fixed = asArray(payload && payload.items);
     } catch (error) {
       const why = String((error && error.message) || error);
@@ -1367,7 +1403,7 @@ function homeTagBar() {
   const choices = (ui.publicPopularTags && ui.publicPopularTags.length)
     ? ui.publicPopularTags : (ui.popularTags || []);
   return `<nav class="home-tags" aria-label="按类型浏览"><button type="button" class="all-tags-link" data-all-tags="1">全部类型 ${icon('arrow')}</button>
-    <div class="home-tag-scroll">${choices.map(([slug, name]) => `<button type="button" class="home-tag" data-tag-slug="${slug}" data-tag-name="${name}">${name}</button>`).join('')}</div></nav>`;
+    <div class="home-tag-scroll">${choices.map(([slug, name]) => `<button type="button" class="home-tag" data-tag-slug="${esc(slug)}" data-tag-name="${esc(name)}">${esc(name)}</button>`).join('')}</div></nav>`;
 }
 
 function homeSignature(data) {
@@ -1604,7 +1640,7 @@ function renderTags() {
   const groups = sections.map(([id, title]) => {
     const members = tags.filter(tag => tag.group === id);
     if (!members.length) return '';
-    return `<section class="tags-group"><h2>${title}</h2><div class="tags-grid">${members.map(tag => {
+    return `<section class="tags-group"><h2>${esc(title)}</h2><div class="tags-grid">${members.map(tag => {
       const name = String(tag.name || tag.slug);
       const size = name.length > 8 ? 'wide' : name.length > 4 ? 'medium' : '';
       return `<button type="button" class="tag-choice ${size}" data-tag-slug="${esc(tag.slug)}" data-tag-name="${esc(name)}">${esc(name)}</button>`;
@@ -1655,7 +1691,7 @@ function renderCategory(keepCompact = false) {
   // 挂上类之后改成横向滚动，两个的源看起来跟原来一模一样。
   // 一个 tab 底下有多个分类才需要这排切换器。原来它只在「私密态」渲染，
   // 于是苹果CMS 那种一个 tab 挂四十多个分类的源永远切不到别的分类。
-  const switcher = tabs.length > 1 ? `<div class="segmented${tabs.length > 2 ? ' many' : ''}" role="tablist">${tabs.map((name, index) => `<button type="button" role="tab" data-sub="${index}" aria-selected="${index === subIndex(state.tab)}" class="${index === subIndex(state.tab) ? 'selected' : ''}">${name}</button>`).join('')}</div>` : '';
+  const switcher = tabs.length > 1 ? `<div class="segmented${tabs.length > 2 ? ' many' : ''}" role="tablist">${tabs.map((name, index) => `<button type="button" role="tab" data-sub="${index}" aria-selected="${index === subIndex(state.tab)}" class="${index === subIndex(state.tab) ? 'selected' : ''}">${esc(name)}</button>`).join('')}</div>` : '';
   // 副标题只有配置给了才画（见 categoryLead）；加载中画骨架卡，不是一片空白。
   //
   // 原来加载时这里是「已显示 0 部」+ 空网格 + 一行「正在加载…」—— 一屏全黑，
@@ -1663,10 +1699,10 @@ function renderCategory(keepCompact = false) {
   // 呼吸，用户知道「这一屏马上有东西」。
   const leadText = categoryLead();
   const loading = !state.category;
-  content.innerHTML = `<div class="category-page"><div class="category-head"><h1>${categoryTitle()}</h1>${leadText ? `<p>${esc(leadText)}</p>` : ''}</div>
+  content.innerHTML = `<div class="category-page"><div class="category-head"><h1>${esc(categoryTitle())}</h1>${leadText ? `<p>${esc(leadText)}</p>` : ''}</div>
     ${switcher}
     ${spotlight}
-    <section class="category-section"><div class="section-heading"><h2>${tabs[subIndex(state.tab)]}作品</h2><span class="category-count">${loading ? '正在加载…' : `已显示 ${items.length} 部`}</span></div>
+    <section class="category-section"><div class="section-heading"><h2>${esc(tabs[subIndex(state.tab)])}作品</h2><span class="category-count">${loading ? '正在加载…' : `已显示 ${items.length} 部`}</span></div>
     <div class="search-grid category-grid">${loading ? skeletonCards(6) : items.map(itemCard).join('')}</div><div class="category-footer">${categoryFooter()}</div></section></div>`;
   compact.innerHTML = compactMarkup();
   scroll.scrollTop = keepCompact ? 150 : 0;
@@ -1798,6 +1834,9 @@ function updateTailMarkup() {
     return `<span class="update-progress"><span class="update-progress-bar"><i style="width:${pct}%"></i></span><small>${pct}%${speed ? ' · ' + speed : ''}</small></span>`;
   }
   if (u.phase === 'checking') return '<span class="settings-chip">检查中</span>';
+  // percent>=100（sha256 校验通过）后的过渡态：安装器由原生自动拉起，这里只说
+  // 一句话、不放按钮 —— 用户取消安装器回来时，看门狗/重检查会把状态收走。
+  if (u.phase === 'ready') return '<span class="settings-chip is-ok">更新包已就绪，正在打开安装程序…</span>';
   if (u.phase === 'error') {
     return `<button type="button" class="settings-mini" data-check-update="1">重试</button>`;
   }
@@ -1841,6 +1880,10 @@ function renderSettings() {
     </section>
 
     ${updateSection()}
+
+    ${window.__hgDebugBuild ? `<section class="settings-card" aria-label="诊断">
+      ${settingsRow('data-cover-diagnostics="1"', 'storage', '封面诊断', '观测集 · 最近失败 · 冻结中', 'debug', '')}
+    </section>` : ''}
 
     <section class="settings-card" aria-label="片单与缓存">
       <div class="settings-row is-static">
@@ -1949,6 +1992,82 @@ function goPlayerSettings() {
   renderPlayerSettings();
   // 页面先用「正在检测…」渲染出来，探测结果回来再补一次 —— 不让这一页等 so 加载。
   nativePlayerInfo().then(() => { if (state.route === 'player-settings') renderPlayerSettings(); });
+}
+
+// ── 封面诊断（方案 §4.5，2026-10-31）─────────────────────────────────
+//
+// 只回答一个问题：「此刻为什么没封面」。三块数据全来自 cover-diag 桥：
+// 观测集（哪些主机裸拉成功过、还信不信）、最近 20 条失败、冻结中的主机和剩余秒数。
+// 入口只在 debug 构建渲染（window.__hgDebugBuild，见 renderSettings）——
+// release 用户的界面上没有这一行，但桥命令本身两边的包都有（排障时可以 CDP 直调）。
+let coverDiagTimer = null;
+
+function goCoverDiagnostics() {
+  if (state.route === 'cover-diagnostics') return;
+  if (state.route !== 'settings') goSettings();
+  state.coverDiagReturn = captureScreen();
+  setRoute('cover-diagnostics');
+  renderCoverDiagnostics();
+  refreshCoverDiagnostics();
+  // 冻结剩余秒数会走，5 秒刷一轮足够看。离开页面由下一个 tick 自己收掉。
+  if (!coverDiagTimer) {
+    coverDiagTimer = setInterval(() => {
+      if (state.route !== 'cover-diagnostics') { clearInterval(coverDiagTimer); coverDiagTimer = null; return; }
+      refreshCoverDiagnostics();
+    }, 5000);
+  }
+}
+
+function refreshCoverDiagnostics() {
+  api('cover-diag').then(data => {
+    state.coverDiag = data;
+    if (state.route === 'cover-diagnostics') renderCoverDiagnostics();
+  }).catch(error => {
+    state.coverDiag = { error: error.message || '诊断数据拿不到' };
+    if (state.route === 'cover-diagnostics') renderCoverDiagnostics();
+  });
+}
+
+function renderCoverDiagnostics() {
+  const data = state.coverDiag || {};
+  const now = Date.now();
+  const observations = asArray(data.observations);
+  const failures = asArray(data.recentFailures);
+  const frozen = asArray(data.frozenHosts);
+  const observationRows = observations.length ? observations.map(one => {
+    const trusted = Boolean(one.trusted);
+    const age = Math.max(0, Math.round((now - Number(one.lastSeenAt || 0)) / 60000));
+    return `<div class="settings-row is-static"><span class="settings-body"><strong>${esc(one.host || '?')}</strong>
+      <small>成功 ${Number(one.ok || 0)} · 失败 ${Number(one.fail || 0)} · ${age} 分钟前命中</small></span>
+      <span class="settings-tail"><span class="settings-chip ${trusted ? 'is-ok' : 'is-warn'}">${trusted ? 'B 观测信任' : 'C 降级待验证'}</span></span></div>`;
+  }).join('') : '<div class="settings-row is-static"><span class="settings-body"><small>还没有观测记录 —— 名单内的封面不会进观测集，这是正常的。</small></span></div>';
+  const failureRows = failures.length ? failures.map(line => {
+    const parts = String(line).split('\t');
+    const at = Number(parts[0]) ? new Date(Number(parts[0])).toLocaleTimeString() : '?';
+    return `<div class="cover-diag-failure"><span class="cover-diag-time">${esc(at)}</span><span>${esc(parts.slice(1).join(' ') || line)}</span></div>`;
+  }).join('') : '<div class="settings-row is-static"><span class="settings-body"><small>最近没有失败。</small></span></div>';
+  const frozenRows = frozen.length ? frozen.map(one => {
+    const left = Math.max(0, Math.ceil((Number(one.until || 0) - now) / 1000));
+    return `<div class="settings-row is-static"><span class="settings-body"><strong>${esc(one.host || '?')}</strong><small>网络类失败后的 45 秒冻结</small></span>
+      <span class="settings-tail"><span class="settings-chip is-warn">剩 ${left}s</span></span></div>`;
+  }).join('') : '<div class="settings-row is-static"><span class="settings-body"><small>没有冻结中的主机。</small></span></div>';
+  content.innerHTML = `<div class="settings-page">
+    <button type="button" class="listing-back" data-back="1">${icon('back')} 返回设置</button>
+    <h1>封面诊断</h1>
+    ${data.error ? `<section class="settings-card is-danger"><div class="settings-row is-static"><span class="settings-body"><strong>诊断数据拿不到</strong><small>${esc(data.error)}</small></span></div></section>` : ''}
+    <section class="settings-card" aria-label="观测集">
+      <div class="settings-row is-static"><span class="settings-body"><strong>观测集</strong><small>裸拉成功进来的图床主机（B 档），上限 32 条、7 天未命中过期</small></span></div>
+      ${observationRows}
+    </section>
+    <section class="settings-card" aria-label="冻结中">
+      <div class="settings-row is-static"><span class="settings-body"><strong>冻结中的主机</strong><small>一次失败冻结 45 秒，期满自动重试</small></span></div>
+      ${frozenRows}
+    </section>
+    <section class="settings-card" aria-label="最近失败">
+      <div class="settings-row is-static"><span class="settings-body"><strong>最近失败</strong><small>最多 20 条，新在前（本地记录，不上报）</small></span></div>
+      <div class="cover-diag-failures">${failureRows}</div>
+    </section>
+  </div>`;
 }
 
 function renderAccountManagement() {
@@ -2239,13 +2358,21 @@ window.hgPredictiveBackCommit = () => {
     const oldPage = content.firstElementChild;
     if (!window.hgBack()) { clearPredictivePreview(); return; }
     if (content.firstElementChild !== oldPage) { clearPredictivePreview(); return; }
+    // 只收自己这一手势的尾：predictivePreview 被新手势换掉后就不再动全局，
+    // 否则一次滞留的收尾会把它正在拖的预览一把清掉。
+    const previewAtCommit = predictivePreview;
+    const settleBack = () => {
+      changed.disconnect();
+      if (predictivePreview === previewAtCommit) clearPredictivePreview();
+    };
     const changed = new MutationObserver(() => {
       if (content.firstElementChild === oldPage) return;
-      changed.disconnect();
-      clearPredictivePreview();
+      settleBack();
     });
     changed.observe(content, { childList: true });
-    predictiveTimer = setTimeout(() => { changed.disconnect(); clearPredictivePreview(); }, 1500);
+    // 兜底断开必须挂局部定时器：predictiveTimer 是共享的，下一次手势的
+    // clearPredictivePreview 会把它清掉，这个 observer 就永远没人断开了。
+    setTimeout(settleBack, 1500);
   }, 150);
   return true;
 };
@@ -2358,6 +2485,7 @@ window.hgBack = () => {
   if (state.route === 'source-settings') { restoreScreen(state.sourceReturn); return true; }
   if (state.route === 'proxy-settings') { restoreScreen(state.proxyReturn); return true; }
   if (state.route === 'player-settings') { restoreScreen(state.playerReturn); return true; }
+  if (state.route === 'cover-diagnostics') { restoreScreen(state.coverDiagReturn); return true; }
   if (state.route === 'market') { restoreScreen(state.marketReturn); return true; }
   if (state.route === 'settings') { restoreScreen(state.settingsReturn); return true; }
   if (state.route === 'detail') { if (detailCard) detailCard.close(); else returnFromDetail(); return true; }
@@ -2389,7 +2517,18 @@ window.hgResume = () => {
   }
   if (state.route === 'library') goLibrary(state.libraryTab);
   if (state.route === 'home') refreshHomeHistory();
-  if (state.route === 'detail' && state.detail) api('bookmark-state', { id: state.detail.id }).then(value => { state.bookmarked = value; renderDetail(); });
+  if (state.route === 'detail' && state.detail) {
+    // 回包可能晚于用户离开详情页（桥池被慢请求占满时要排队）。没有守卫的话
+    // renderDetail() 会把详情页盖到当前路由上；catch 也不能省，失败即 unhandled rejection。
+    const token = routeToken;
+    api('bookmark-state', { id: state.detail.id })
+      .then(value => {
+        if (token !== routeToken || state.route !== 'detail') return;
+        state.bookmarked = value;
+        renderDetail();
+      })
+      .catch(() => {});
+  }
 };
 
 // ---- 竖屏沉浸流：一屏一集，上下滑切换，自动续播 ----
@@ -2612,6 +2751,7 @@ document.addEventListener('submit', async event => {
     button.disabled = true;
     button.textContent = '正在拉取…';
     const sub = subState();
+    const routeAtSubmit = state.route;
     if (statusLine) { statusLine.hidden = false; statusLine.classList.remove('is-bad'); statusLine.textContent = '正在拉取订阅…'; }
     try {
       const result = await proxyCoreCommand('sub?url=' + encodeURIComponent(url));
@@ -2641,7 +2781,8 @@ document.addEventListener('submit', async event => {
         subTesting: false, subBad: false,
         freeTesting: false,
       });
-      renderProxySettingsKeepScroll();
+      // await 期间用户可能已经离开代理设置页，别把旧页面盖到新路由上。
+      if (state.route === routeAtSubmit) renderProxySettingsKeepScroll();
       // 拉完直接测这份订阅，用户不用再点一次 —— 「拉取」这个动作的意图就是要连上。
       runSpeedTest('subscription');
     } catch (problem) {
@@ -2689,10 +2830,12 @@ document.addEventListener('click', async event => {
     checkAppUpdate();
     return;
   }
-  if (event.target.closest('[data-secret-entry]')) { handleVersionTap(); return; }
+  // data-secret-entry（设置页的版本图标）：连点进私密库的入口删了，
+  // handleVersionTap 一并删掉。按钮还在渲染，点击落到底就是无操作。
   if (event.target.closest('[data-account-management]')) { goAccountManagement(); return; }
   if (event.target.closest('[data-proxy-settings]')) { goProxySettings(); return; }
   if (event.target.closest('[data-player-settings]')) { goPlayerSettings(); return; }
+  if (event.target.closest('[data-cover-diagnostics]')) { goCoverDiagnostics(); return; }
   const playerSet = event.target.closest('[data-player-set]');
   if (playerSet) {
     const [key, value] = String(playerSet.dataset.playerSet || '').split(':');
@@ -2808,11 +2951,13 @@ document.addEventListener('click', async event => {
     const dropButton = event.target.closest('[data-source-forget]');
     const dropUrl = dropButton.dataset.sourceForget;
     if (!dropUrl) return;
+    const routeAtClick = state.route;
     dropButton.disabled = true;
     try {
       await sourceCommand('forget?url=' + encodeURIComponent(dropUrl));
       await refreshSources();
-      renderSourceSettings();
+      // await 期间用户可能已经离开源设置页，别把旧页面盖到新路由上。
+      if (state.route === routeAtClick) renderSourceSettings();
       toast('已删除');
     } catch (problem) { toast(problem.message, true); }
     return;
@@ -3025,10 +3170,12 @@ document.addEventListener('click', async event => {
       toast('内容缓存已清空');
     } else if (clear.dataset.clear === 'history' || clear.dataset.clear === 'bookmarks') {
       const history = clear.dataset.clear === 'history';
+      const routeAtClick = state.route;
       if (!await askConfirmation(history ? '清空观看历史' : '清空我的收藏', history ? '所有观看记录会被删除，我的收藏会保留。' : '所有收藏作品会被移除，观看历史会保留。')) return;
       await api(history ? 'clear-history' : 'clear-bookmarks');
       state.library = await api('library');
-      renderSettingsKeepScroll();
+      // await 期间可能已经离开设置页，别把设置页盖到新路由上。
+      if (state.route === routeAtClick) renderSettingsKeepScroll();
       toast(history ? '观看历史已清空' : '收藏已清空');
     }
   }
@@ -3076,10 +3223,16 @@ content.addEventListener('touchcancel', () => {
   scheduleBannerAuto();
 }, { passive: true });
 
-api('app-version').then(version => {
-  appVersion = String(version || '');
+api('app-version').then(info => {
+  // 2026-10-31 起返回 {version, debug}（debug 给「封面诊断」入口做显隐）。
+  // 兼容一下旧形状（裸字符串），热更停用后这段兜底只是防御。
+  const payload = (info && typeof info === 'object') ? info : { version: info };
+  appVersion = String(payload.version || '');
+  window.__hgDebugBuild = Boolean(payload.debug);
   const label = content.querySelector('.app-version-text');
   if (label) label.textContent = `版本 v${appVersion}`;
+  // debug 构建补渲染设置页：首画时 app-version 多半还没回来，诊断行会缺席。
+  if (window.__hgDebugBuild && state.route === 'settings') renderSettingsKeepScroll();
 }).catch(() => {});
 // 启动 4 秒后静默查一次更新（app-update.js 的 autoCheckUpdate）。
 //

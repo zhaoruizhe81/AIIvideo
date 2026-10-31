@@ -108,6 +108,7 @@ function backDestination() {
   if (state.route === 'proxy-settings') return state.proxyReturn?.route || 'settings';
   if (state.route === 'source-settings') return state.sourceReturn?.route || 'settings';
   if (state.route === 'market') return state.marketReturn?.route || 'settings';
+  if (state.route === 'cover-diagnostics') return state.coverDiagReturn?.route || 'settings';
   if (state.route === 'settings') return state.settingsReturn?.route || 'library';
   if (state.route === 'tags') return state.tagsReturn?.route || 'home';
   if (state.route === 'listing' && state.listing?.kind === 'tag-list') return state.listingReturn?.route || 'home';

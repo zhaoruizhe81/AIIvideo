@@ -131,16 +131,64 @@ final class SpiderStore {
             // （需要 abi 2，当前 1）」这种能直接转述给用户的话。
             throw new IOException(e.reason);
         }
-        String source = e.readSource(ctx);
-        if (source == null || source.length() == 0) {
-            throw new IOException("spider 源码是空的：" + spiderId);
+        // Binder 上只传「路径 + 大小 + 修改时间」三个字段，:spider 进程按路径自读
+        // （readInstalledSource）—— 全量传源码的话，2MB 的源会撞
+        // TransactionTooLargeException（Binder 事务缓冲约 1MB），装得进却永远调不动。
+        // 门禁（abi/元信息）已经在 find+parse 这一步判过；子进程读回时还会对指纹，
+        // 中途被换过（重新安装）的文件到不了执行那一步。
+        if (e.file == null || !e.file.isFile()) {
+            throw new IOException("spider 源文件不见了：" + e.fileName);
         }
         Log.i(TAG, "cap=" + cap + " id=" + spiderId + " src=" + e.source
-                + " bytes=" + source.length());
+                + " bytes=" + e.file.length());
         // 2026-10-19：宿主在 :spider 独立进程里跑（见 SpiderService 类注释）——
         // Android WebView 全 app 共享渲染主线程，spider 一次抓取解析会冻住主页面
         // 的动画/滚动，进程隔离是唯一根治。这里只是换了个调用通道，契约不变。
-        return SpiderClient.call(ctx, source, cap, args, timeoutMs);
+        return SpiderClient.call(ctx, e.file.getAbsolutePath(),
+                e.file.length(), e.file.lastModified(), cap, args, timeoutMs);
+    }
+
+    /**
+     * 按「路径 + 大小 + 修改时间」把一份已安装的源读回字符串（:spider 进程用）。
+     *
+     * <p>同 uid 跨进程可读 {@code files/spiders/}；installTo 的「写临时文件 →
+     * rename」保证读到的要么是完整旧版要么是完整新版，不会是半截。
+     *
+     * <p>大小或修改时间对不上 = 主进程门禁扫描之后文件被换过（重新装/删）：
+     * 那一版没过过 ABI 门禁，不能装没看见直接执行 —— 报错让上层重试。
+     */
+    static String readInstalledSource(Context ctx, String path, long expectBytes, long expectMtime)
+            throws IOException {
+        return readFromSourceDir(installDir(ctx), path, expectBytes, expectMtime);
+    }
+
+    /** 读回的实体。和 Context 解耦是为了能在 JVM 单测里跑（同 installTo 的理由）。 */
+    static String readFromSourceDir(File dir, String path, long expectBytes, long expectMtime)
+            throws IOException {
+        if (path == null || path.length() == 0) {
+            throw new IOException("没有带源文件路径。");
+        }
+        final File f = new File(path);
+        if (!f.isFile()) {
+            throw new IOException("源文件不见了：" + f.getName());
+        }
+        try {
+            // 路径只该指向本应用私有源目录下的 .js：请求即使被拼了别的路径，
+            // 这里也读不到别的东西。
+            final String home = dir.getCanonicalPath() + File.separator;
+            if (!f.getCanonicalPath().startsWith(home) || !f.getName().endsWith(".js")) {
+                throw new IOException("源文件路径不在源目录里：" + f.getName());
+            }
+        } catch (IOException e) {
+            throw e;
+        } catch (Throwable pathCheckFailed) {
+            throw new IOException("源文件路径校验失败：" + pathCheckFailed);
+        }
+        if (f.length() != expectBytes || f.lastModified() != expectMtime) {
+            throw new IOException("源文件刚被更新过（" + f.getName()
+                    + " 的大小/修改时间与请求时对不上），请重试。");
+        }
+        return readFully(new FileInputStream(f));
     }
 
     /**
@@ -205,7 +253,11 @@ final class SpiderStore {
 
         if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("建不了源的目录：" + dir);
         File target = new File(dir, e.id + ".js");
-        File tmp = new File(dir, e.id + ".js.tmp");
+        // 临时文件带随机后缀：两个线程同时装同一个 id 时，固定名字会让两份内容
+        // 交错写进同一个文件，先完成的 rename 把混合物固化成「坏源」。随机名各写
+        // 各的，rename 仍然整体覆盖 target。后缀以 .js.tmp 结尾，扫描时照样被
+        // fromFile 的 .js 过滤挡住，不会冒出孤儿条目。
+        File tmp = new File(dir, e.id + "." + java.util.UUID.randomUUID() + ".js.tmp");
         java.io.FileOutputStream out = new java.io.FileOutputStream(tmp);
         try {
             out.write(raw);
@@ -348,15 +400,8 @@ final class SpiderStore {
         boolean ok = true;
         String reason = "";
         String fileName = "";
+        /** 源永远来自磁盘上这个文件（用户装的）；调用时只把路径+指纹递给子进程。 */
         File file;
-
-        /** 源永远来自磁盘上那个文件（用户装的）。 */
-        String readSource(Context ctx) throws IOException {
-            if (file == null || !file.isFile()) {
-                throw new IOException("源文件不见了：" + fileName);
-            }
-            return readFully(new FileInputStream(file));
-        }
     }
 
     private static final class Meta {
@@ -364,6 +409,8 @@ final class SpiderStore {
         String name;
         String version;
         String requires;
+        /** 源里写没写 requires 这个键（值可能是读不出字面量的写法，比如数字）。 */
+        boolean requiresWritten;
     }
 
     private static Entry rejected(String fileName, String source, String reason) {
@@ -393,6 +440,12 @@ final class SpiderStore {
         e.fileName = fileName;
 
         String problem = abiProblem(e.requires);
+        // requires 这个键写了但读不出字符串字面量（写成数字 2、模板串、带转义引号）：
+        // 按 abiProblem 自己声明的「认不出来的一律拒绝」处理。当没写放行的话，
+        // 老壳会静默跑上一个要求新 ABI 的源 —— 恰是门禁要挡的那件事。
+        if (problem == null && m.requires == null && m.requiresWritten) {
+            problem = "requires 写法不支持（只支持字符串 \">=N\"）";
+        }
         if (problem != null) {
             e.ok = false;
             e.reason = problem;
@@ -422,7 +475,14 @@ final class SpiderStore {
         m.name = strField(body, "name");
         m.version = numField(body, "version");
         m.requires = strField(body, "requires");
+        m.requiresWritten = hasKey(body, "requires");
         return m;
+    }
+
+    /** 键存在性探测：值读不读得出字面量由 strField 判断，这里只看「写了没有」。 */
+    private static boolean hasKey(String body, String key) {
+        Matcher m = Pattern.compile("(?:^|[,{\\s])" + key + "\\s*:").matcher(body);
+        return m.find();
     }
 
     /**

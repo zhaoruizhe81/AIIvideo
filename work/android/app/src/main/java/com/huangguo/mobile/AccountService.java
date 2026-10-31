@@ -8,6 +8,7 @@ import android.graphics.Matrix;
 import android.media.ExifInterface;
 import android.net.Uri;
 import android.util.Base64;
+import android.util.Log;
 import com.parse.ParseACL;
 import com.parse.ParseException;
 import com.parse.ParseFile;
@@ -110,6 +111,9 @@ final class AccountService {
                 currentUser.fetch();
                 this.lastProfileRefresh = System.currentTimeMillis();
             } catch (Exception unused) {
+                // 刷新失败不算错（本地这份还能用），但失败本身要留痕，
+                // 否则「资料一直是旧的」查不出是没到间隔还是一直在失败。
+                Log.w("AIIvideo", "[account] profile 刷新失败，先用本地缓存：" + unused);
             }
         }
         String userId = currentUser.getObjectId();
@@ -130,6 +134,9 @@ final class AccountService {
                     saveAvatar(avatarFile, remoteAvatar.getData());
                     avatarPrefs.edit().putString(userId, remoteName).apply();
                 } catch (Exception unused2) {
+                    // 下载失败本地留旧图，但得留痕：不记的话「头像一直是旧的」
+                    // 分不清是没换过还是每次都下失败。
+                    Log.w("AIIvideo", "[account] 头像下载失败，本地留旧图：" + unused2);
                 }
             }
         }

@@ -97,6 +97,34 @@ final class Outbound {
     }
 
     /**
+     * 从 URL 提取小写 host。这是**唯一**的 host 提取实现 —— 接口通道（AiiHttp）与
+     * 中继通道（VlcRelay）都来这里问，别再各写一份。
+     *
+     * <p>优先 OkHttp 的 {@code HttpUrl}：它宽松（原始中文、空格、竖线这类未转义
+     * 字符都收），而且就是真正发请求的那个解析器 —— 用它判路由，判出来的口径和
+     * 请求实际打出去的口径必然一致。它解析不出（无 scheme 等）再退严格
+     * {@code java.net.URI}；两条路都失败返回空串，调用方按各自的兜底语义处理
+     * （{@link #viaProxy} 是带代理，{@code needsRelayHop} 是不绕中继）。
+     *
+     * <p>原来中继侧自己 {@code new URI} 判：同一个含未转义字符的地址，AiiHttp
+     * 侧经 URL/HttpUrl 判直连、中继侧解析失败被判代理 —— 路由正好相反，症状
+     * 是「该直连的 CDN 被塞回境外节点 403」，和 2026-10-21 AGE 那次同型。
+     *
+     * @param url 目标地址；null 或完全解析不出返回空串
+     */
+    static String hostOf(String url) {
+        if (url == null || url.length() == 0) return "";
+        okhttp3.HttpUrl parsed = okhttp3.HttpUrl.parse(url);
+        if (parsed != null) return parsed.host();
+        try {
+            String host = new java.net.URI(url.trim()).getHost();
+            return host == null ? "" : host.toLowerCase(java.util.Locale.ROOT);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
      * 这条地址该不该走代理。
      *
      * <p>判据只有一处：{@link NetRoute#mustProxy}（源声明了 net 就按声明，没声明就
@@ -107,13 +135,9 @@ final class Outbound {
      */
     static boolean viaProxy(String url) {
         if (url == null || url.length() == 0) return false;
-        try {
-            String host = new java.net.URI(url).getHost();
-            if (host == null || host.length() == 0) return true;
-            return NetRoute.mustProxy(host);
-        } catch (Throwable e) {
-            return true;
-        }
+        String host = hostOf(url);
+        if (host.length() == 0) return true;
+        return NetRoute.mustProxy(host);
     }
 
     /**

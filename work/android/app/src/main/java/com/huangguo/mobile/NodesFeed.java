@@ -229,8 +229,13 @@ final class NodesFeed {
      *
      * 候选地址逐个试，第一个成功的就停 —— 顺序在 Endpoints 里定义。
      * 全部失败**不动缓存**：旧的节点再差也比没有强。
+     *
+     * 整个方法锁在类对象上：后台自动刷新（proxyBoot 的守护线程）和用户点
+     * 「检查更新」（桥线程）可能同时进来，两边写同一个 .tmp 会交错出一份坏
+     * 缓存 —— 读侧虽然会校验失败回退 assets 自愈，但那等于把一次成功的更新
+     * 无声丢掉。
      */
-    static Status refresh(Context context) {
+    static synchronized Status refresh(Context context) {
         Status status = status(context);
         List<String> candidates = Endpoints.nodesUrls();
         List<String> tried = new ArrayList<String>();

@@ -66,6 +66,12 @@ public class VlcRelayTest {
         return out;
     }
 
+    /** 回指 URL 剥掉签名参数，留下 u 的 base64 串（decode 断言用）。 */
+    private static String u(String line) {
+        int k = line.indexOf("&k=");
+        return k >= 0 ? line.substring(0, k) : line;
+    }
+
     @Test
     public void master里的子播放列表全部指向中继() throws Exception {
         String[] out = VlcRelay.rewriteM3u8(fixture("missav-master-fct210.m3u8"), MASTER, PREFIX);
@@ -78,10 +84,10 @@ public class VlcRelayTest {
         }
         assertEquals("360p 的相对路径必须解析回原目录",
                 "https://surrit.com/" + UUID + "/360p/video.m3u8",
-                VlcRelay.decode(lines.get(0).substring(PREFIX.length())));
+                VlcRelay.decode(u(lines.get(0)).substring(PREFIX.length())));
         assertEquals("1080p 同理",
                 "https://surrit.com/" + UUID + "/1080p/video.m3u8",
-                VlcRelay.decode(lines.get(3).substring(PREFIX.length())));
+                VlcRelay.decode(u(lines.get(3)).substring(PREFIX.length())));
     }
 
     @Test
@@ -94,10 +100,10 @@ public class VlcRelayTest {
         assertEquals("5", out[1]);
         assertEquals("分片是 .jpeg 伪装的 TS，路径同样要拼回原目录",
                 "https://surrit.com/" + UUID + "/720p/video0.jpeg",
-                VlcRelay.decode(lines.get(0).substring(PREFIX.length())));
+                VlcRelay.decode(u(lines.get(0)).substring(PREFIX.length())));
         assertEquals("末尾那条也要改，别只改头几条",
                 "https://surrit.com/" + UUID + "/720p/video1146.jpeg",
-                VlcRelay.decode(lines.get(4).substring(PREFIX.length())));
+                VlcRelay.decode(u(lines.get(4)).substring(PREFIX.length())));
     }
 
     /**
@@ -126,7 +132,7 @@ public class VlcRelayTest {
         java.util.List<String> lines = uris(out[0]);
         assertEquals(1, lines.size());
         assertEquals("https://cdn.example.com/a/b/video0.ts",
-                VlcRelay.decode(lines.get(0).substring(PREFIX.length())));
+                VlcRelay.decode(u(lines.get(0)).substring(PREFIX.length())));
     }
 
     /**
@@ -160,7 +166,7 @@ public class VlcRelayTest {
         assertTrue("要包成中继：" + wrapped, wrapped.startsWith(PREFIX));
         assertEquals("解码后必须还原成 CDN 上的绝对地址",
                 "https://play.hhuus.com/play/lejBBoPe/enc.key",
-                VlcRelay.decode(wrapped.substring(PREFIX.length())));
+                VlcRelay.decode(u(wrapped).substring(PREFIX.length())));
 
         assertEquals("一条分片 + 一条 KEY，别把 #EXTINF 也算进去", "2", out[1]);
         assertTrue("结束标记不能被吃掉", out[0].contains("#EXT-X-ENDLIST"));
@@ -231,5 +237,72 @@ public class VlcRelayTest {
         assertFalse(VlcRelay.disguised("https://a.example/api/videos/123"));
         assertFalse(VlcRelay.disguised("https://a.example/x/segment.MP4"));
         assertFalse(VlcRelay.disguised(null));
+    }
+
+    // ── 本地中继的签名（防同机借用）────────────────────────────────────
+    //
+    // 中继是无鉴权代理、绑 127.0.0.1，而 Android 各应用共享 loopback：不验签
+    // 等于同机任意应用都能借道我们配的代理出口。这里钉住三件事——纯函数层的
+    // 签名/验签回环、回指 URL 统一带有效签名、以及起真中继打三种坏请求全 403。
+
+    /** HMAC 链路：自己的 k 能验过；缺失 / 篡改 / 挪到别的 u 上都验不过。 */
+    @Test
+    public void 签名与验证回环() {
+        String a = "https://surrit.com/x/720p/video0.jpeg";
+        String b = "https://surrit.com/x/720p/video1.jpeg";
+        String k = VlcRelay.signFor(a);
+        assertTrue("k 非空：" + k, k.length() > 0);
+        assertTrue("自己的 k 能验过", VlcRelay.verifyFor(a, k));
+        assertFalse("k 缺失不能过（空串）", VlcRelay.verifyFor(a, ""));
+        assertFalse("k 缺失不能过（null）", VlcRelay.verifyFor(a, null));
+        assertFalse("挪到别的 u 上不能过（u 与 k 绑定）", VlcRelay.verifyFor(b, k));
+        assertFalse("篡改的 k 不能过",
+                VlcRelay.verifyFor(a, k.substring(0, k.length() - 2) + "AA"));
+    }
+
+    /** 统一出口 relayUrl：地址带签名参数，且这个签名对解码还原出的 u 有效。 */
+    @Test
+    public void 回指URL都带有效签名() {
+        String url = VlcRelay.relayUrl(PREFIX, MASTER);
+        assertTrue("仍以 prefix 开头：" + url, url.startsWith(PREFIX));
+        int k = url.indexOf("&k=");
+        assertTrue("回指 URL 必须带签名：" + url, k >= 0);
+        String target = VlcRelay.decode(url.substring(PREFIX.length(), k));
+        assertEquals(MASTER, target);
+        assertTrue("URL 里的 k 必须对这条 u 有效",
+                VlcRelay.verifyFor(target, url.substring(k + 3)));
+        // m3u8 改写出来的每一行也必须是这个形状（统一出口，漏一个就是 403 黑屏）
+        String[] out = VlcRelay.rewriteM3u8Smart("#EXTM3U\n#EXTINF:4,\nvideo0.jpeg\n", MASTER, PREFIX);
+        String line = uris(out[0]).get(0);
+        assertTrue("改写行也带签名：" + line, line.contains("&k="));
+        assertTrue("改写行的签名对这条 u 有效",
+                VlcRelay.verifyFor(VlcRelay.decode(u(line).substring(PREFIX.length())),
+                        line.substring(line.indexOf("&k=") + 3)));
+    }
+
+    /** 打一个回指请求，返回状态码。 */
+    private static int relayStatus(String path) throws Exception {
+        java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                new java.net.URL("http://127.0.0.1:" + VlcRelay.ensure().port() + path).openConnection();
+        c.setConnectTimeout(2000);
+        c.setReadTimeout(2000);
+        int code = c.getResponseCode();
+        c.disconnect();
+        return code;
+    }
+
+    /** 起真中继打坏请求：k 缺失 / k 篡改 / 换 u 后旧 k，一律 403，且不碰上游。 */
+    @Test
+    public void 无签名与坏签名一律403() throws Exception {
+        String a = "https://surrit.com/x/720p/video0.jpeg";
+        String b = "https://surrit.com/x/720p/video1.jpeg";
+        String kA = VlcRelay.signFor(a);
+        try {
+            assertEquals(403, relayStatus("/s?u=" + VlcRelay.encode(a)));                    // k 缺失
+            assertEquals(403, relayStatus("/s?u=" + VlcRelay.encode(a) + "&k=AAAA"));        // k 篡改
+            assertEquals(403, relayStatus("/s?u=" + VlcRelay.encode(b) + "&k=" + kA));       // 换 u 后旧 k
+        } finally {
+            VlcRelay.shutdown();
+        }
     }
 }

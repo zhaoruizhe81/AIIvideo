@@ -356,32 +356,42 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         savedPosition = startedAt;
 
         // mini-feed：eps 至少要两集才值得起翻页器，单集走老路。
+        readPayloadShape();
+
+        controls = new VlcControlsView(this, new ControlsHost());
+        buildUi();
+        if (!feedMode) installSurfaceCallback();
+        VlcControlsView.applyImmersive(this);
+        startPlayback();
+    }
+
+    /** 按 payload 算播放形态：eps 至少两集才走 mini-feed 翻页器，单集走老路。 */
+    private void readPayloadShape() {
         org.json.JSONArray epsRaw = payload.optJSONArray("eps");
         if (epsRaw != null && epsRaw.length() > 1) {
             feedMode = true;
             eps = new int[epsRaw.length()];
             for (int i = 0; i < epsRaw.length(); i++) eps[i] = epsRaw.optInt(i, i + 1);
             curPos = Math.max(0, Math.min(eps.length - 1, payload.optInt("index", 0)));
+        } else {
+            feedMode = false;
         }
+    }
 
-        controls = new VlcControlsView(this, new ControlsHost());
-        buildUi();
-        if (!feedMode) {
-            surface.getHolder().addCallback(new SurfaceHolder.Callback() {
-                @Override public void surfaceCreated(SurfaceHolder holder) {}
-                @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-                    surfaceWidth = width;
-                    surfaceHeight = height;
-                    applyWindowSize();
-                }
-                @Override public void surfaceDestroyed(SurfaceHolder holder) {
-                    surfaceWidth = 0;
-                    surfaceHeight = 0;
-                }
-            });
-        }
-        VlcControlsView.applyImmersive(this);
-        startPlayback();
+    /** 单集模式的 surface 回调：把 SurfaceView 的像素尺寸记下来交给 applyWindowSize。 */
+    private void installSurfaceCallback() {
+        surface.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder holder) {}
+            @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                surfaceWidth = width;
+                surfaceHeight = height;
+                applyWindowSize();
+            }
+            @Override public void surfaceDestroyed(SurfaceHolder holder) {
+                surfaceWidth = 0;
+                surfaceHeight = 0;
+            }
+        });
     }
 
     private void startPlayback() {
@@ -690,11 +700,21 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        persist(ended);
+        // 先落旧现场再换：feed 和单集各有一份（persist 在 feed 模式直接 return，
+        // 对照 onBackPressed 的写法）。
+        if (feedMode) persistFeedProgress();
+        else persist(ended);
         try {
             String raw = intent.getStringExtra(EXTRA_PAYLOAD);
             if (raw == null) return;
             JSONObject parsed = new JSONObject(raw);
+            // payload 是 final 字段，「整体替换」= 先清空旧键再装入新 payload。
+            // 以前是 merge：上一部戏的 alts/start/referer 会残留进新会话，
+            // 表现是新集拿着旧集的备选线路表、从旧集的位置起播。
+            java.util.List<String> stale = new ArrayList<String>();
+            java.util.Iterator<String> oldKeys = payload.keys();
+            while (oldKeys.hasNext()) stale.add(oldKeys.next());
+            for (int i = 0; i < stale.size(); i++) payload.remove(stale.get(i));
             java.util.Iterator<String> keys = parsed.keys();
             while (keys.hasNext()) {
                 String key = keys.next();
@@ -703,27 +723,43 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         } catch (Throwable ignored) { return; }
 
         ended = false;
+        sawEnd = false;
         tCreate = System.currentTimeMillis();
         tLogged = false;
         android.util.Log.i("HG.Vlc", "换集：重开 media");
         startedAt = payload.optLong("start", 0L);
         savedPosition = startedAt;
         durationMs = 0;
+        // 错误状态和副标题缓存都是上一部戏的现场：错误块在下面的 buildUi 里重建过
+        // （新的 errorView 是空的），不清的话 play_end 会把上一部的错算到这一部头上，
+        // describeTrack 也会以为副标题已经写过了。
+        errorShown = false;
+        errorText = "";
+        lastMeta = "";
         if (feedMode) {
             // feed 用的是一对 player，closePlayer 只管单集那个 —— 不在这里收掉
             // 旧的一对，再 initFeedVlc 就是两个实例叠着放，声音会双重。
             releaseFeedPlayers();
             // 换集：五个集合 + 换线游标 + 续播现场一起清。
             session.reset();
-            // 预热账本和结束标记都是上一部的，不复位的话换集后 playPage 会把
-            // 旧页当成暖的直接 play，play_end 还会把 finished 误报成 true。
-            sawEnd = false;
+            // 预热账本都是上一部的，不复位的话换集后 playPage 会把
+            // 旧页当成暖的直接 play。
             warmPos = -1;
             warmUrl = "";
             warmingPos = -1;
             pendingResume = 0;
         }
         closePlayer();
+        // feedMode/eps/curPos 是按 payload 算出来的。上面那套清理用的是换集前的形态
+        // （该收的旧 player 都收掉了），现在按新 payload 重算 —— 不重算的话换集后
+        // 还停在上一部戏的集数表和起播集上。
+        readPayloadShape();
+        // 视图树是按旧形态搭的（feed = 翻页器、单集 = SurfaceView），换集可能换形态。
+        // 照 onCreate 的顺序重建一遍，startPlayback 在新形态上走。
+        controls = new VlcControlsView(this, new ControlsHost());
+        buildUi();
+        if (!feedMode) installSurfaceCallback();
+        VlcControlsView.applyImmersive(this);
         startPlayback();
     }
 
@@ -737,7 +773,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         // 锁着的时候返回键不退出 —— 误触锁的一大半用途就是防这个。
         if (locked) {
             controls.showHint("已锁定 · 连点两次小锁解锁");
-            controls.hideHintAfter(1500, ui);
+            controls.hideHintAfter(1500);
             return;
         }
         if (feedMode) persistFeedProgress();
@@ -781,7 +817,10 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             record.put("at", System.currentTimeMillis());
             getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                     .edit().putString(KEY_LAST, record.toString()).apply();
-        } catch (Throwable ignored) {}
+        } catch (Throwable e) {
+            // 静默落盘失败 = 用户进度悄悄丢，至少留一行日志能对着查。
+            android.util.Log.d("AIIvideo", "[player] 进度落盘失败：" + e);
+        }
     }
 
     // ── 界面 ─────────────────────────────────────────────────────────
@@ -826,7 +865,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             controls.showHint("已解锁");
             setControlsVisible(true);
         }
-        controls.hideHintAfter(1800, ui);
+        controls.hideHintAfter(1800);
     }
 
     private void buildUi() {
@@ -881,7 +920,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                             float dx = e.getX() - downX, dy = e.getY() - downY;
                             if (Math.abs(dx) < dp(TOUCH_SLOP_DP) && Math.abs(dy) < dp(TOUCH_SLOP_DP)) {
                                 controls.showHint("已锁定 · 连点两次小锁解锁");
-                                controls.hideHintAfter(1500, ui);
+                                controls.hideHintAfter(1500);
                             }
                         }
                         if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
@@ -923,7 +962,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                             float dx = e.getX() - downX, dy = e.getY() - downY;
                             if (Math.abs(dx) < dp(TOUCH_SLOP_DP) && Math.abs(dy) < dp(TOUCH_SLOP_DP)) {
                                 controls.showHint("已锁定 · 连点两次小锁解锁");
-                                controls.hideHintAfter(1500, ui);
+                                controls.hideHintAfter(1500);
                             }
                         }
                         return;
@@ -998,7 +1037,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                 if (Math.abs(dx) < dp(TOUCH_SLOP_DP) && Math.abs(dy) < dp(TOUCH_SLOP_DP)
                         && System.currentTimeMillis() - downAt < 300) {
                     controls.showHint("已锁定 · 连点两次小锁解锁");
-                    controls.hideHintAfter(1500, ui);
+                    controls.hideHintAfter(1500);
                 }
             }
             return true;
@@ -1534,7 +1573,10 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             if (!vout.areViewsAttached()) vout.attachViews();
             attachedTo.put(mp, pv.texture);
             setWindowSizeFor(mp, pv.getWidth(), pv.getHeight());
-        } catch (Throwable ignored) {}
+        } catch (Throwable e) {
+            // 挂不上 vout 的表现是「有声无画」，黑屏又无日志最难查，留一行。
+            android.util.Log.d("AIIvideo", "[player] 挂 vout 失败 pos=" + pos + "：" + e);
+        }
     }
 
     /** 画面就绪了（或被兜底定时器叫醒）：把音量抬回正常。 */
@@ -1893,7 +1935,10 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             record.put("at", System.currentTimeMillis());
             getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                     .edit().putString(KEY_LAST, record.toString()).apply();
-        } catch (Throwable ignored) {}
+        } catch (Throwable e) {
+            // 同 persist：落盘失败必须留痕，不能静默丢进度。
+            android.util.Log.d("AIIvideo", "[player] feed 进度落盘失败：" + e);
+        }
     }
 
     private void releaseFeedPlayers() {

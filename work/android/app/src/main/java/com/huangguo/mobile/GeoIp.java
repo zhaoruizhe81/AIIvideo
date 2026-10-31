@@ -53,7 +53,12 @@ final class GeoIp {
             InputStream in = context.getAssets().open(ASSET);
             byte[] raw = readAll(in);
             in.close();
-            if (!loadBytes(raw)) failed = true;
+            if (!loadBytes(raw)) {
+                failed = true;
+                // 表内容不合法（magic 头不对 / 数据截断）。跟下面 catch 一样要留痕：
+                // 不然「节点列表的国家列集体消失」在 logcat 里无从查起。
+                UserSource.log("GeoIP 表加载失败：内容不合法（" + raw.length + " 字节）");
+            }
         } catch (Throwable t) {
             failed = true;
             UserSource.log("GeoIP 表加载失败：" + t);
@@ -182,19 +187,11 @@ final class GeoIp {
         if (!loaded) return null;
         int ip = toInt(host);
         if (ip == 0) {
-            String cc = null;   // 域名：解析一次再查，解不出来就当没有
-            try {
-                java.net.InetAddress addr = java.net.InetAddress.getByName(host);
-                byte[] raw = addr.getAddress();
-                if (raw != null && raw.length == 4) {
-                    ip = ((raw[0] & 0xFF) << 24) | ((raw[1] & 0xFF) << 16)
-                            | ((raw[2] & 0xFF) << 8) | (raw[3] & 0xFF);
-                }
-            } catch (Throwable ignored) {}
-            if (ip == 0) { cache.put(host, ""); return null; }
-            cc = search(ip);
-            cache.put(host, cc == null ? "" : cc);
-            return cc;
+            // 域名：不做 DNS。表只按 IP 建，而解析一次的阻塞会落在桥线程池上 ——
+            // 解析慢/解析失败的域名能把一整批测速回复拖住数秒。缓存空答案，
+            // 既不让列表挂着「查国家」的等待，也别每次都重跑这段。
+            cache.put(host, "");
+            return null;
         }
         String cc = search(ip);
         cache.put(host, cc == null ? "" : cc);

@@ -1,5 +1,6 @@
 package com.huangguo.mobile;
 
+import android.util.Log;
 import org.json.JSONArray;
 
 import java.io.ByteArrayOutputStream;
@@ -78,12 +79,22 @@ public final class UpdateMirror {
             } catch (Throwable th) {
                 continue;
             }
+            // versionCode 缺失或 <=0 的不参选：有的镜像在 200 状态下吐 JSON 错误页
+            // （限流、上游故障），让它当选会把「没有新版本」坐实，还会顺着 check()
+            // 的 clearCandidate() 把本地待更新的清单抹掉。
+            if (code <= 0) continue;
             if (code > bestCode) {
                 bestCode = code;
                 best = body;
             }
         }
         return best;
+    }
+
+    /** 一行人的异常摘要：类名 + message（可空），给 [update] 日志用。 */
+    private static String brief(Throwable e) {
+        String message = e.getMessage();
+        return e.getClass().getSimpleName() + (message == null ? "" : (": " + message));
     }
 
     /**
@@ -129,6 +140,9 @@ public final class UpdateMirror {
                             if (total <= 0) return Long.MAX_VALUE;
                             return System.currentTimeMillis() - started;
                         } catch (Throwable e) {
+                            // 测速失败是常态（挂掉的镜像排到最后），但一个都不留痕的话，
+                            // 「四条全挂、永远选中第一条」这类故障没人能对账。
+                            Log.d("AIIvideo", "[update] 测速失败 " + url + "：" + brief(e));
                             return Long.MAX_VALUE;
                         } finally {
                             if (conn != null) try { conn.disconnect(); } catch (Throwable ignored) {}
@@ -200,6 +214,8 @@ public final class UpdateMirror {
             }
             return new String(out.toByteArray(), "UTF-8");
         } catch (Throwable e) {
+            // 静默失败是这条通道的历史事故根源（见 docs/热更新说明.md），至少留个痕迹。
+            Log.d("AIIvideo", "[update] 清单地址拉取失败 " + url + "：" + brief(e));
             return null;
         } finally {
             if (conn != null) try { conn.disconnect(); } catch (Throwable ignored) {}
@@ -259,7 +275,10 @@ public final class UpdateMirror {
                     if (piece.length() == 1) hex.append('0');
                     hex.append(piece);
                 }
-                if (!want.equals(hex.toString())) {
+                // 常量时间比较，不给逐字节猜哈希留计时侧信道。
+                if (!java.security.MessageDigest.isEqual(
+                        want.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                        hex.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8))) {
                     dest.delete();
                     throw new java.io.IOException("下载包的 sha256 不对，可能被截断了");
                 }
