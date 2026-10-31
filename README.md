@@ -28,13 +28,11 @@
 
 上下滑切集，左右划拖进度（一屏宽约 120 秒，拖动中中央显示目标位置），两条轴不抢。横屏只旋转播放区，滚动容器不动；倍速、画面翻转、断点续播都在。
 
-<p align="center"><img src="docs/screenshots/feed.jpg" alt="竖屏播放流，上下滑动切换剧集"></p>
 
 ## 详情与选集
 
 单集、多集、多线路都能画出来。点进详情直接起播，不用来回跳。
 
-<p align="center"><img src="docs/screenshots/detail.jpg" alt="详情页与选集网格"></p>
 
 ## 收藏与观看历史
 
@@ -86,7 +84,7 @@ trojan / shadowsocks / hysteria2 这几种。节点自己填，应用不预置�
 
 ```bash
 cd work/android
-./scripts/build.sh verify    # 清空重建 + 311 个单测 + 断言 APK
+./scripts/build.sh verify    # 清空重建 + 350 个单测 + 断言 APK
 ./scripts/build.sh install   # 构建 → 装真机 → 冷启动 → 截图
 ```
 
@@ -101,5 +99,5 @@ cd work/android
 [真机 WebView 调试](docs/真机WebView调试.md)；新加出站请求（取流通道、字幕、密钥）之前
 先看 [出站请求的两条通道](docs/出站请求的两条通道.md)。
 
-文档怎么分现行与历史、哪篇已经过时、删掉的四篇原来讲什么，见
+文档怎么分现行与历史、哪篇已经过时、删掉的七篇原来讲什么，见
 [文档索引](docs/README.md)。

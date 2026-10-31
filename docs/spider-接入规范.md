@@ -171,7 +171,7 @@ ctx.log(args)        // = ctx.call('log', args)
 ```js
 const r = await ctx.net({
   url: 'https://example.com/list?page=1',
-  method: 'GET',                       // GET（默认）/ POST
+  method: 'GET',                       // GET（默认）/ POST；其他值（PUT/DELETE/…）会直接报错，不再静默按 POST 发
   headers: { 'User-Agent': '…' },
   body: 'a=1&b=2',                     // POST 的表单体（默认 form）
   format: 'form',                      // 'form'（默认）/ 'json'
@@ -335,7 +335,7 @@ return { items: [ { name: '中文字幕', slug: 'chinese-sub', group: 'subtitle'
 |---|---|---|
 | `id` | string | **必填且非空**。详情/播放都靠它，空了卡片点不动 |
 | `title` | string | 卡片标题 |
-| `cover` | string | **https 绝对地址**，主机必须在 `cover.allowedHosts` 里 |
+| `cover` | string | **https 绝对地址**，主机必须在 `cover.allowedHosts` 里（2.0.29 起漏了的域会自动裸拉自愈，但别依赖——老客户端直接丢） |
 | `score` | number/string | 评分，可空 |
 | `tags` | string[] | 角标标签 |
 | `description` | string | 简介 |
@@ -355,10 +355,13 @@ return { items: [ { name: '中文字幕', slug: 'chinese-sub', group: 'subtitle'
 - `cover.mode: "plain"`：原样用。
 - `cover.mode: "aes-cbc"`：App 下载后按 `key/iv/transformation` 解密，
   `keyEncoding` 支持 `text`/`base64`/`hex`。
-- **域名不在 `allowedHosts` 里的封面会被丢掉**，卡片显示灰块。换图床记得改这张表，
-  或者用 `hostRewrites` 把旧域映射到新域。
-- **封面地址必须 https**：`SiteProfile.coverUrl` 对非 https 直接抛「无效封面地址」，
-  这张卡就没有封面。协议相对地址 `//cdn/x.jpg` 会被补成 `https:`。
+- **域名不在 `allowedHosts` 里的封面**：老客户端（< 2.0.29）直接丢掉、卡片灰块；
+  新客户端（≥ 2.0.29）会对它**裸拉试一次**，验图通过就进观测集（自动信任），此后
+  正常取图——图床轮换不用再改配置。名单建议照写全（老客户端只认名单），
+  换图床也可以用 `hostRewrites` 把旧域映射到新域。
+- **封面地址必须 https**：对非 https 直接抛「无效封面地址」，这张卡就没有封面。
+  协议相对地址 `//cdn/x.jpg` 会被补成 `https:`。字面 IP、`.local`、带 userinfo/
+  fragment 的地址在 2.0.29 起任何情况下都不放行（安全地板，名单洞穿不了）。
 
 ---
 
@@ -546,7 +549,8 @@ node scripts/model-check.js        # spider 输出 → 前端形状
 配置：
 
 - [ ] `origin` 是 https 裸域名（无路径、无 query）
-- [ ] `cover.allowedHosts` 覆盖了所有封面域名
+- [ ] `cover.allowedHosts` 覆盖了所有封面域名（2.0.29 起新客户端对名单外主机会自动
+      裸拉自愈，漏一两个不再致命；但老客户端只认名单，仍建议写全）
 - [ ] `web.spider` 指向的 js 能下载、大小 < 2MB
 - [ ] 需要站点参数的源写了 `web.spiderArgs`，且配置里真有那些键
 - [ ] 路由要写死的源才写 `net.declared: true`（不写就跟随 App 的全局代理开关）
@@ -595,7 +599,7 @@ node scripts/model-check.js        # spider 输出 → 前端形状
 | 「共 3 集」但实际 12 集 | 只返回了一页剧集又没给 `episodeCount` | 填 `episodeCount` |
 | 点播放报格式不支持 | `url` 是密文/相对地址/自定义 scheme | 给 http(s) 直链，或改用 `reason` |
 | 切一次线路回来换源了 | `url` 不在 `alts` 里 | 让 `url` 落进 `alts` |
-| 封面全是灰块 | 封面域名不在 `cover.allowedHosts`，或给了相对路径 | 加白名单 / 给绝对地址 |
+| 封面全是灰块 | 封面域名不在 `cover.allowedHosts`，或给了相对路径（2.0.29 起新客户端会自动裸拉自愈；先过 45 秒再刷一次，仍灰才是名单问题） | 加白名单 / 给绝对地址 |
 | 拉 24 条详情超时 | 用了 `Promise.all`（实际串行） | 改 `netAll` |
 | 拿到的是 5KB 的挑战页 | 盾后站点没声明 `web.shield` | 加 `shield.warmup/hosts/cookie` |
 | 每次请求都慢十几秒 | 源在被盾站点上自己重试 | 删掉自己的挑战检测和重试，交给壳 |

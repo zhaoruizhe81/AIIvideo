@@ -10,6 +10,87 @@
 > 历史。看的时候注意每段的日期。哪份文档是现行口径、哪份只剩历史价值，
 > 看 [`docs/README.md`](docs/README.md)。
 
+## 2026-10-31 深夜：封面信任模型改造落地（P1+P2+P3）
+
+「封面灰块」按当晚评审通过的方案（`docs/history/2026-10-31-封面信任模型改造方案.md`）
+实施了主体三阶段。核心变化：`allowedHosts` 从「唯一的门」降级为「安全地板」——名单外
+的封面主机先用**裸请求**（只带 `Referer: <源 origin>`，绝不带 cookie/源 UA）试拉一次，
+验图通过就进按源隔离的观测集（上限 32 条、7 天未命中过期、连续 3 次失败降回待验证），
+此后带源 header 正常取——图床轮换从此不用任何人跟。配套：缓存键自适应易变参数剔除
+（`CoverParamMemory`，同 path 出现第二个不同值当场判易变，七名种子之上增量）；
+`cover-diag` 桥命令 + debug 构建的「封面诊断」页（观测集 / 最近失败 / 冻结中三块）；
+前端灰块按页面计数合并上报 `cover_placeholder`。顺手修掉负缓存跨源不清的旧账
+（`resetCoverFailureCache` 挂进装源 / 清源 / 恢复出厂）。
+
+验证（本机）：单测 **350 个 0 失败**（41 个测试类，+3：`CoverTrustStoreTest` /
+`CoverTierTest` / `CoverParamMemoryTest`），`./scripts/build.sh verify` 通过，
+APK 39.1 MB。线上配置一个字没动（方案 §九：先实现验证，后发版）。
+**待办：真机 7f8f5254 按 §七 清单跑模拟轮换 / 换源清空 / 断网归因三项（debug 包看
+诊断页），过了再出 2.0.29。**
+
+## 2026-10-31 夜：全量代码审计，44 条真实 bug，修掉 42 条
+
+对 `work/android` 全部 56 个主源码文件做了一轮逐行审计（4 路并行：网络、播放、
+spider、基础设施；关键条目由主审逐一对照源码复核），确认 **44 条真实 bug**：
+高危 6、中危 16、其余为低危。随后 4 个常驻队友按互斥写范围并行修复，当晚收口。
+
+装机验证：`2.0.28`（20028）19:35 覆盖安装到真机 7f8f5254（原 2.0.27，数据保留），
+冷启动正常；`compileDebugJavaWithJavac` + `testDebugUnitTest` 全绿，单测
+**312 个 0 失败**（38 个测试类，较此前 +1 类：BackGestureTest 重写扩边值用例）。
+装完测试就撞上了下一节的封面问题 —— 修出来的包先踩了坑。
+
+### 高危 6 条（都是「功能在但方向反了」）
+
+| 位置 | 症状 |
+|---|---|
+| `MainActivity.dark()` | 条件反转：跟随系统恒深色，用户显式选浅色被无视 |
+| `VlcRelay` 播放列表改写分支 | Content-Length 用字符数、body 按 UTF-8 字节写，带中文标题的列表被 VLC 截尾 |
+| `VlcRelay.writeHeadAs` | 上游无 Content-Length 时声明 `chunked`，body 却是裸流直写，严格解 chunk 必炸 |
+| `AiiHttp` CLIENTS 缓存键 | DNS 只记 `getSimpleName()`（恒 `"SmartDns"`），源 A 的钉死 hosts/DoH 会被源 B 复用 —— 换源后解析到错 IP 的「串源」 |
+| `ProxyCore.sameNode/copy` | 漏 `publicKey/shortId/allowInsecure/upMbps/downMbps` 等：reality/hy2 节点换源 reapplyRouting() 用缺参配置重启核心，握手必败 |
+| `SpiderRuntime.driverJs` | Promise 没有 `.catch`，源里异步 throw 被掩盖成「15 秒超时」并触发看门狗销毁页面 |
+
+### 中危里值得记的
+
+- **ReportQueue**：claimFiles 把目录里全部 `.jsonl` 改名 `.sending`，但单批只消费
+  200 条 —— 超出的滞留 `.sending`，本进程内永不发送（recoverSending 只在启动跑）。
+  修法是溢出部分当场 release 回去，`release()` 顺手加 `isFile()` 守卫防恢复路径刷假警。
+- **SpiderClient**：`:spider` 进程被杀后 `bindAttempted` 不复位、`bound` 闩锁已开，
+  重连窗口内所有调用立刻报「绑定失败」；`onBindingDied` 不 unbind 还漏 binder 注册。
+  两个回调统一「try-unbind → connection=null → bindAttempted=false」。
+- **AppStore.applyCloudSnapshot**：bookmarks 整份照抄云端不走墓碑（history 那半走了），
+  多设备丢本地未上云收藏。补了对称的墓碑合并。
+- **XrayConfig**：分享链接 `sni=` 直接覆写 `node.host`，ws 的 Host 头被顶掉。Node 新增
+  `sni` 字段分家，生成侧三处 serverName 收口到 `serverNameOf()`（sni 优先 → host → server）。
+- 另有 GeoIp 的 HashMap 跨线程读写、SocksBridge accept 单次异常永久退出、
+  CmsXml 两条 `$$$` 列表计数源不一致（线路名和地址错位）、封面缓存键漏 query、
+  WebView 调试开关无条件打开、EXIF 270° 被错位成 libVLC 常量 267 等。
+
+### 与审计单不同的三处落地（都有证据，记下防止后人按旧结论改回去）
+
+1. **sni-only 链接保留回填 host**：审计原案「sni 完全不碰 host」会让 4 条现有单测变红
+   （`ShareLinkTest` 等），实际改成「host 已有值绝不覆写、为空才用 sni 补缺省」——
+   bug 场景（host 与 sni 同现）已修死，sni-only 行为不变。ss 密码 percent-encode
+   顺带在 `parseShadowsocks` 补了 percentDecode 闭环，否则编码后的密码到对端是 `%40` 字面量。
+2. **BackGesture 的边语义**：审计引的「1=左缘/2=右缘」来自恢复时写错的那句注释。
+   platform jar `javap` 实证 `EDGE_LEFT=0 / EDGE_RIGHT=1`——只删了不可达的
+   `swipeEdge == 2` 短路、修正注释，travelled 公式按真实语义保留（照审计字面改会把
+   左缘手势进度钉死 0）。
+3. **0x510 的构成**：`LAYOUT_STABLE | LAYOUT_FULLSCREEN | LIGHT_NAVIGATION_BAR`，
+   不是审计括号里写的那组（算术对不上）；深色分支取 0，浅色挂旗标，原逻辑如此。
+
+### 跳过 1 条 + Lead 收尾修 2 条
+
+- 跳过：ReportQueue 两条「已发送重发」路径 —— 服务端按条去重可容忍，文件头注释已
+  声明该权衡，改动风险大于收益。
+- Lead 收尾：spider 组留了两个会卡编译的尾巴当场修掉 —— `URL.getRawQuery()` 不存在
+  （改 `getQuery()`）、`SpiderStore` 把 `tmp.delete()` 放进 finally 导致成功路径
+  rename 前就删临时文件（改为仅失败路径删）。
+
+修法与逐条 diff 都在工作区（29 文件 +508/-135，未提交）。这轮另发现：封面缓存键
+补 query 之后，当晚又被下一节的 `cacheKeyQuery()` 签名剔除叠了一层 —— 现在的键是
+「query 算键、签名参数先剔掉」，两层不冲突。
+
 ## 2026-10-31 晚：黄果没有封面，三件事叠在一起
 
 用户报「黄果短剧没有封面」。真机（7f8f5254，2.0.28）上确实是整页占位首字

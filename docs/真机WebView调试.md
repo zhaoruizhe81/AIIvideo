@@ -4,7 +4,10 @@
 省掉了「加日志 → 重新打包 → 装真机」那一圈。
 
 前提只有一个：`MainActivity` 里开了 `WebView.setWebContentsDebuggingEnabled(true)`
-（第 155 行）。这个开关是**发布版也生效**的，不需要 debug 包。
+（onCreate 里，跟着 `FLAG_DEBUGGABLE` 走）。**2026-10-31 起发布版关掉了这个开关**
+——以前无条件打开，等于每台装了 release 包的手机都留着检查器；现在只有 debug 包
+（或 manifest 里显式 `android:debuggable`）能连。要调真机页面，先
+`./gradlew :app:assembleDebug` 装个 debug 包。
 
 ---
 
