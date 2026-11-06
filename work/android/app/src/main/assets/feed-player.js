@@ -937,7 +937,12 @@
       const dur = Math.max(0, (Number(session.duration) || 0) / 1000);
       if (dur > 0) remember(id, ep, pos, dur);
 
-      const page = feed
+      // 来源形态：原生侧两份进度（整部剧 feed / 单集）共用同一个 prefs key "last"，
+      // 靠 session.mode 区分。单集（single）这一场跟当前 feed 的页码无关 —— 它的
+      // episode 是单集 payload 自己的，绝不能用它去定位 feed 页、挪播放头、自动滑
+      // 下一集（那会把用户正在看的 feed 页带跑）。单集只回收进度、不碰 feed 页。
+      const isSingle = session.mode === 'single';
+      const page = (!isSingle && feed)
         ? feed.querySelector('.feed-page[data-video-id="' + id + '"][data-ep="' + ep + '"]')
         : null;
       if (dur > 0) {
