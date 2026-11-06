@@ -156,4 +156,85 @@ public class ReportQueueTest {
             throw new AssertionError(error);
         }
     }
+
+    // ── 高危修复：4xx 毒事件隔离后不得再写回队列（否则无限重发）──────────
+    //
+    // 现场：send() 走 4xx 分支 → bisect 把发不出去的那一条 isolate 进 dead/、
+    // 把发得出去的收进 sentOk。旧代码 consume(claimed, sentOk) 用
+    // remaining(one.items, sentOk) 剔除「已发」—— 但被 isolate 的那条不在
+    // sentOk 里，于是被当成「没发出去」写回 .jsonl，下一轮 flush 又读到它、
+    // 又 4xx、又 isolate、又写回……死循环，dead/ 每轮重复写，backlog 永不递减。
+    //
+    // 修法：bisect 同时收集 isolated，consume 的剔除口径变成「已发 ∪ 已隔离」。
+    // 下面直接盯 remaining(items, sent, isolated) 这条不变式。
+
+    @Test
+    public void 四xx毒事件隔离后不再写回队列() {
+        // 一轮 flush：5 条，第 3 条（下标 2）是恒 4xx 的毒事件。
+        List<JSONObject> items = new ArrayList<JSONObject>();
+        for (int i = 0; i < 5; i++) {
+            items.add(event("evt-" + i));
+        }
+        JSONObject poison = items.get(2);
+        // bisect 的产物：好的 4 条进 sentOk，毒的那 1 条进 isolated。
+        List<JSONObject> sentOk = new ArrayList<JSONObject>(items);
+        sentOk.remove(poison);
+        List<JSONObject> isolated = new ArrayList<JSONObject>();
+        isolated.add(poison);
+
+        List<JSONObject> rest = ReportQueue.remaining(items, sentOk, isolated);
+
+        // 关键断言：坏的进了 dead/ 就该从队列剔除，好的都发掉了 —— 一条都不该写回。
+        assertTrue("毒事件已隔离、好事件已发，队列文件里不该再残留任何一条", rest.isEmpty());
+        // 再钉死一遍：毒事件绝不能出现在写回集合里（这就是无限重发的直接来源）。
+        assertTrue("毒事件不得写回队列", !rest.contains(poison));
+    }
+
+    @Test
+    public void 毒事件第二轮flush不会被重发且backlog可递减() {
+        // 承接上一条：模拟「第二轮 flush 读到的磁盘内容」。
+        // 第二轮只会读到上一轮 consume 之后 rewrite 回 .jsonl 的 rest ——
+        // 只要 rest 里没有毒事件，它就再也不会被读取、不会再被 post。
+        List<JSONObject> all = new ArrayList<JSONObject>();
+        for (int i = 0; i < 5; i++) {
+            all.add(event("evt-" + i));
+        }
+        JSONObject poison = all.get(2);
+        List<JSONObject> sentOk = new ArrayList<JSONObject>(all);
+        sentOk.remove(poison);
+        List<JSONObject> isolated = new ArrayList<JSONObject>();
+        isolated.add(poison);
+
+        // 第一轮写回的内容（应该为空）。
+        List<JSONObject> rewritten = ReportQueue.remaining(all, sentOk, isolated);
+        assertEquals(0, rewritten.size());
+        // 第一轮「已处理」（已发 + 已隔离）的条数 = 5 = 文件全部条目 → consume 里
+        // dropped 会是 5，backlog 正常减去 5（不再有残留条目把 backlog 卡住）。
+        assertEquals(5, all.size() - rewritten.size());
+
+        // 第二轮：磁盘上（rewritten）为空 → 没有任何事件会被再次 post，毒事件不复发。
+        List<JSONObject> secondRound = ReportQueue.remaining(rewritten, new ArrayList<JSONObject>(), new ArrayList<JSONObject>());
+        assertTrue("第二轮 flush 没有东西可发，毒事件不会重发", secondRound.isEmpty());
+    }
+
+    @Test
+    public void 未发也未隔离的事件仍然留着重试() {
+        // 反向保护：429/5xx 那种「整批待重试」或超出单批未发的事件，既不在 sent
+        // 也不在 isolated —— 必须原样留着，不能被这次修复顺手删掉。
+        JSONObject retry = event("retry");
+        List<JSONObject> rest = ReportQueue.remaining(
+                Arrays.asList(retry), new ArrayList<JSONObject>(), new ArrayList<JSONObject>());
+        assertEquals(1, rest.size());
+        assertTrue(rest.get(0) == retry);
+    }
+
+    @Test
+    public void 二参remaining行为不变_isolated为空() {
+        // 既有调用点（2xx 成功分支）继续用两参重载，语义不变。
+        JSONObject a = event("a");
+        JSONObject b = event("b");
+        List<JSONObject> rest = ReportQueue.remaining(Arrays.asList(a, b), Arrays.asList(a));
+        assertEquals(1, rest.size());
+        assertTrue(rest.get(0) == b);
+    }
 }

@@ -272,8 +272,12 @@ final class ReportQueue {
         // 400/413：单条问题。二分到最小，把发不出去的那条隔离，其余收下。
         Log.w(TAG, "服务端拒收（HTTP " + status + "），" + batch.size() + " 条开始二分隔离");
         List<JSONObject> sentOk = new ArrayList<JSONObject>();
-        bisect(batch, sentOk);
-        consume(claimed, sentOk);
+        List<JSONObject> isolated = new ArrayList<JSONObject>();
+        bisect(batch, sentOk, isolated);
+        // 剔除口径必须是「已发 ∪ 已隔离」：进了 dead/ 的事件已经处理完，
+        // 绝不能再被 consume 当成「没发出去」写回 .jsonl —— 否则下一轮 flush
+        // 又读到它、又 4xx、又隔离、又写回，无限重发且 backlog 永不递减。
+        consume(claimed, sentOk, isolated);
         return true;
     }
 
@@ -282,12 +286,13 @@ final class ReportQueue {
      *
      * **不能用「成功的条数」当返回值。** 坏事件可能在中间，那时「前 200 条成功」
      * 这个假设就不成立了 —— 直接按条数从前缀切，会把没发出去当成发过的删掉。
-     * 所以这里按**身份**返回：ok 里是真正被服务端收下的那些对象。
+     * 所以这里按**身份**返回：ok 里是真正被服务端收下的那些对象，isolated 里是
+     * 被扔进 dead/ 的那些对象 —— 两者相加才是「本批已处理完」的全集。
      *
      * 两半都要走：head 失败只说明坏事件在 head 里，tail 完全可能是好的。
      * 只递归 head 的话，tail 得等下一轮 flush 才试 —— 一次故障要发好几轮才清空。
      */
-    private void bisect(List<JSONObject> batch, List<JSONObject> ok) throws Exception {
+    private void bisect(List<JSONObject> batch, List<JSONObject> ok, List<JSONObject> isolated) throws Exception {
         if (batch.isEmpty()) {
             return;
         }
@@ -304,6 +309,11 @@ final class ReportQueue {
                 throw new java.io.IOException("二分途中服务端回 " + solo);
             }
             isolate(only);
+            // isolate 成功就是「已处理」—— 记进 isolated，consume 靠它把这条从
+            // 队列文件里剔掉，不能再写回。isolate 内部建目录/写盘失败时它自己会
+            // Log.w 并 return；那种情况也仍记进 isolated：这条本来就被服务端拒收，
+            // 留在队列里只会无限重发，宁可丢它也不让队列卡死。
+            isolated.add(only);
             return;
         }
         int mid = batch.size() / 2;
@@ -317,9 +327,9 @@ final class ReportQueue {
             // 把本次认领的文件全部 release，等退避重来。
             throw new java.io.IOException("二分途中服务端回 " + status);
         } else {
-            bisect(head, ok);
+            bisect(head, ok, isolated);
         }
-        bisect(tail, ok);
+        bisect(tail, ok, isolated);
     }
 
     /** 发不出去的那条：进 dead/，不进 backlog、不再重发。 */
@@ -371,14 +381,23 @@ final class ReportQueue {
      *
      * 用 IdentityHashMap：同一批里可能有多条内容相同的事件（重试刷出来的），
      * 按 equals 去重会连没发出去的一起删。
+     *
+     * `handled` = 已发成功的 ∪ 已隔离进 dead/ 的。两者都已经处理完、都不该留在
+     * 队列文件里；只有「既没发出去、也没被隔离」的（服务端 429/5xx 那种整批
+     * 待重试的、超出单批未发的）才写回。这条口径是本类最关键的不变式：
+     * 进了 dead/ 的事件绝不能再写回 .jsonl（否则无限重发）。
      */
     private void consume(List<Batch> claimed, List<JSONObject> sent) {
+        consume(claimed, sent, java.util.Collections.<JSONObject>emptyList());
+    }
+
+    private void consume(List<Batch> claimed, List<JSONObject> sent, List<JSONObject> isolated) {
         synchronized (this) {
             for (Batch one : claimed) {
-                List<JSONObject> rest = remaining(one.items, sent);
+                List<JSONObject> rest = remaining(one.items, sent, isolated);
                 int dropped = one.items.size() - rest.size();
                 if (dropped == 0) {
-                    // 这个文件一条都没发出去，原样还回去。
+                    // 这个文件一条都没发出去、也没被隔离 —— 原样还回去。
                     release(one.file);
                     continue;
                 }
@@ -408,9 +427,21 @@ final class ReportQueue {
      * 包可见 + 不碰文件系统，纯逻辑，单测直接盯。
      */
     static List<JSONObject> remaining(List<JSONObject> items, List<JSONObject> sent) {
+        return remaining(items, sent, java.util.Collections.<JSONObject>emptyList());
+    }
+
+    /**
+     * 三参版：剔除「已发成功 ∪ 已隔离」两类。已隔离的事件已经进了 dead/，绝不能
+     * 再写回队列（否则下一轮重发同一条）。包可见 + 纯逻辑，单测直接盯。
+     */
+    static List<JSONObject> remaining(List<JSONObject> items, List<JSONObject> sent,
+                                      List<JSONObject> isolated) {
         java.util.IdentityHashMap<JSONObject, Boolean> acked =
                 new java.util.IdentityHashMap<JSONObject, Boolean>();
         for (JSONObject event : sent) {
+            acked.put(event, Boolean.TRUE);
+        }
+        for (JSONObject event : isolated) {
             acked.put(event, Boolean.TRUE);
         }
         List<JSONObject> rest = new ArrayList<JSONObject>();
