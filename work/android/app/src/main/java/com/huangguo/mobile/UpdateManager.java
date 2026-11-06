@@ -51,10 +51,28 @@ final class UpdateManager {
     private static final int MANUAL_LIMIT = 5;
     private static final long MANUAL_WINDOW_MS = 3600000;
     private static final Pattern VERSION = Pattern.compile("\\d+\\.\\d+\\.\\d+");
-    private Candidate candidate;
+    /**
+     * 当前待更新的候选。volatile：{@link #cached()} 已去锁（见其注释），会在下载
+     * 进行中并发写它（从回放缓存解析出候选），而 {@link #download()} 在锁内读它。
+     * 引用赋值本身就原子，volatile 保证可见性即可，不需要再靠锁保护。
+     */
+    private volatile Candidate candidate;
     private final Context context;
     /** volatile：isDownloading() 是给桥做防重入预检的，不能等锁（download() 会握锁几分钟）。 */
     private volatile boolean downloading;
+    /**
+     * {@code available_manifest} 的进程内原子快照。
+     *
+     * <p>{@link #cached()} 是「下载中点开设置页」那条路径上的回放入口，挂在模块 1
+     * 的单线程本地池里。它原来直接 {@code preferences.getString(...)} 且整方法
+     * {@code synchronized}，与握锁十几分钟的 {@link #download()} 抢同一把实例锁，
+     * 一堵就把整条本地池（library / bookmark-state / get-progress）带死。
+     *
+     * <p>现在 cached() 去锁、只读这个 volatile 快照；写方（check()/clearCandidate()）
+     * 在改 prefs 的同时原子替换它。String 引用替换本身原子，读侧零锁零网络。
+     * 首帧从 prefs 里灌一次（重启后可用），之后只在写路径维护。
+     */
+    private volatile String manifestSnapshot;
     private final SharedPreferences preferences;
 
     interface Progress {
@@ -118,26 +136,67 @@ final class UpdateManager {
         Context applicationContext = context.getApplicationContext();
         this.context = applicationContext;
         this.preferences = applicationContext.getSharedPreferences("updates", 0);
+        // 快照首发：进程重启后 cached() 仍能从上次落盘的清单回放（零网络）。
+        this.manifestSnapshot = this.preferences.getString("available_manifest", null);
     }
 
-    synchronized JSONObject cached() throws Exception {
-        String manifestJson = this.preferences.getString("available_manifest", null);
+    /**
+     * 回放上一次查到的清单（零网络）。
+     *
+     * <p><b>故意不加 synchronized：</b>它是「下载中点开设置页」那条路径上的回放
+     * 入口（桥指令 cached-update，落在模块 1 的单线程本地池里）。以前整方法
+     * synchronized，与全程握锁、可能十几分钟的 {@link #download()} 抢同一把实例锁，
+     * 一堵就把整条本地池（library / bookmark-state / get-progress）带死 —— 用户看到
+     * 的是「点什么都没反应」。现在只读 {@link #manifestSnapshot}（volatile 原子引用），
+     * 瞬时返回，不被下载阻塞。
+     *
+     * <p>零网络契约不变：这里只解析快照 + 读本机 {@link PackageInfo}，挑源
+     * （{@link UpdateMirror#pick}）仍然只在 {@link #download()} 那一刻做。
+     * {@code getPackageManager().getPackageInfo} 是纯本机调用，不走网络。
+     */
+    JSONObject cached() throws Exception {
+        String manifestJson = this.manifestSnapshot;
         if (manifestJson == null) {
             return status("none");
         }
-        try {
-            JSONObject manifest = new JSONObject(manifestJson);
-            PackageInfo self = this.context.getPackageManager().getPackageInfo(this.context.getPackageName(), 0);
-            if (manifest.optLong("versionCode") <= installedVersionCode(self)) {
-                clearCandidate();
-                return status("none");
-            }
-            Candidate parsed = candidateFrom(manifest);
-            this.candidate = parsed;
-            return availableStatus(parsed, self.versionName);
-        } catch (Exception unused) {
+        PackageInfo self = this.context.getPackageManager().getPackageInfo(this.context.getPackageName(), 0);
+        CachedReplay replay = replayCached(manifestJson, installedVersionCode(self), self.versionName);
+        if (replay == null) {
+            // 快照不是合法清单，或版本已经不新 —— 清掉候选与缓存（与原来语义一致）。
             clearCandidate();
             return status("none");
+        }
+        this.candidate = replay.candidate;
+        return replay.status;
+    }
+
+    /** cached() 的纯计算部分：喂快照 + 已装版本，产出「要不要报有更新」。抽出来是为了单测。 */
+    static final class CachedReplay {
+        final Candidate candidate;
+        final JSONObject status;
+
+        CachedReplay(Candidate candidate, JSONObject status) {
+            this.candidate = candidate;
+            this.status = status;
+        }
+    }
+
+    /**
+     * 纯函数：从清单原文回放「有没有更新」，不碰网络、不碰 Android Context。
+     *
+     * @return null 表示清单非法或已装版本不比它旧（调用方清候选、报 none）；
+     *         否则返回候选 + available 状态。
+     */
+    static CachedReplay replayCached(String manifestJson, long installedCode, String installedVersion) {
+        try {
+            JSONObject manifest = new JSONObject(manifestJson);
+            if (manifest.optLong("versionCode") <= installedCode) {
+                return null;
+            }
+            Candidate parsed = candidateFrom(manifest);
+            return new CachedReplay(parsed, availableStatus(parsed, installedVersion));
+        } catch (Exception unused) {
+            return null;
         }
     }
 
@@ -148,6 +207,7 @@ final class UpdateManager {
 
     private void clearCandidate() {
         this.candidate = null;
+        this.manifestSnapshot = null;
         this.preferences.edit().remove("available_manifest").apply();
     }
 
@@ -270,7 +330,11 @@ final class UpdateManager {
         }
 
         this.candidate = candidateFrom(manifest);
-        this.preferences.edit().putString("available_manifest", manifest.toString()).apply();
+        // 先更新进程内 volatile 快照，再落盘 prefs。cached() 读的是快照，
+        // 这样「刚查到有更新 → 紧接着 cached-update 回放」能立刻看到同一份清单。
+        String raw = manifest.toString();
+        this.manifestSnapshot = raw;
+        this.preferences.edit().putString("available_manifest", raw).apply();
         return availableStatus(this.candidate, currentVersion);
     }
 
