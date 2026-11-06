@@ -813,6 +813,11 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             record.put("position", Math.max(0, position));
             record.put("duration", Math.max(0, durationMs));
             record.put("finished", finished || ended);
+            // 来源形态：本方法只在 !feedMode 时被调用（feed 模式 :792 早退），
+            // 所以恒为 single。两份进度共用同一个 prefs key "last"，前端靠它区分
+            // 「这一场是单集还是整部剧的某集」，别把单集当成 feed 去续播/翻页。
+            // 口径与 play_start/play_end 埋点（:403/:666/:1236/:1256）一致。
+            record.put("mode", progressMode(feedMode));
             record.put("error", errorText);
             record.put("at", System.currentTimeMillis());
             getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -1914,6 +1919,35 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                 + " · " + (curPos + 1) + "/" + eps.length);
     }
 
+    /**
+     * feed 进度落盘的「已看完」判据。
+     *
+     * <p>不能只看 {@code ended}：feed 末集 {@code EndReached} 会「落盘后立刻把
+     * {@code ended} 置回 false」以便自动滑下一集，于是退出/退后台时再落一次盘
+     * 就会把刚写好的「已看完」覆盖成 false —— 观看历史永远记成没看完。
+     * {@code sawEnd} 会在本次会话里一直留着这个事实（换集时才在 onNewIntent 清），
+     * 所以取「或」。口径与 onDestroy 的 play_end 埋点、{@link #persist(boolean)} 一致。
+     *
+     * <p>包内可见、纯函数：input→output 完全由参数决定，单测直接钉住。
+     */
+    static boolean feedFinished(boolean ended, boolean sawEnd) {
+        return ended || sawEnd;
+    }
+
+    /**
+     * 进度落盘的「来源形态」字符串。
+     *
+     * <p>{@link #persist(boolean)}（单集）与 {@link #persistFeedProgress()}（feed）
+     * 共用同一个 prefs key {@code "last"}，前端 {@code checkNativeReturn} 靠这个
+     * 字段区分「这一场是单集还是整部剧的某集」，避免拿 feed 的 episode 去续单集。
+     * 口径与 play_start / play_end 埋点（{@code feedMode ? "feed" : "single"}）一致。
+     *
+     * <p>包内可见、纯函数：两侧落盘都调它，单测直接钉住取值。
+     */
+    static String progressMode(boolean feedMode) {
+        return feedMode ? "feed" : "single";
+    }
+
     /** 把当前这一集的现场写进 prefs。切集和退出都会调。 */
     private void persistFeedProgress() {
         try {
@@ -1930,7 +1964,14 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             record.put("source", payload.optString("source", ""));
             record.put("position", position);
             record.put("duration", duration);
-            record.put("finished", ended);
+            // finished 必须算上 sawEnd：feed 末集 EndReached 里「落盘后立刻把
+            // ended 置回 false 以便自动滑下一集」，只读 ended 的话，退出/退后台
+            // 再落一次盘就把「已看完」覆盖成 false —— 观看历史永远记成没看完。
+            // 口径对齐 onDestroy 的 play_end 埋点（ended||sawEnd）与 persist()。
+            record.put("finished", feedFinished(ended, sawEnd));
+            // 来源形态：本方法只在 feed 模式被调用，恒为 feed。与 persist() 共用
+            // prefs key "last"，前端靠 mode 区分来源（别拿 feed 的 episode 去续单集）。
+            record.put("mode", progressMode(feedMode));
             record.put("error", errorText);
             record.put("at", System.currentTimeMillis());
             getSharedPreferences(PREFS, Context.MODE_PRIVATE)
