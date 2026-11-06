@@ -1,15 +1,15 @@
 {
-  "versionName": "2.0.29",
-  "tag": "v2.0.29",
-  "versionCode": 20029,
-  "apk": "AIIvideo-v2.0.29-release.apk",
+  "versionName": "2.0.30",
+  "tag": "v2.0.30",
+  "versionCode": 20030,
+  "apk": "AIIvideo-v2.0.30-release.apk",
   "urls": [
-    "https://gh-proxy.com/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.29/AIIvideo-v2.0.29-release.apk",
-    "https://ghfile.geekertao.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.29/AIIvideo-v2.0.29-release.apk",
-    "https://gh.dpik.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.29/AIIvideo-v2.0.29-release.apk",
-    "https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.29/AIIvideo-v2.0.29-release.apk"
+    "https://gh-proxy.com/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.30/AIIvideo-v2.0.30-release.apk",
+    "https://ghfile.geekertao.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.30/AIIvideo-v2.0.30-release.apk",
+    "https://gh.dpik.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.30/AIIvideo-v2.0.30-release.apk",
+    "https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.30/AIIvideo-v2.0.30-release.apk"
   ],
-  "sha256": "573031f74e79d81fbcd3657c2a3dcf69de44e9370f86c6f085caaa64e292c17c",
-  "size": 41023018,
-  "notes": "2.0.29：对全部应用代码做了一轮九模块并行深审（桥接 / 播放器 / 网络 / 代理 / Spider 运行时 / 存储 / 更新 / 前端），修掉五十多处问题，外加三项安全加固。这版更新比较大，挑能感知的说：\n\n**一、崩溃与数据**\n\n- 修复「下载更新途中页面崩过一次，下一条更新进度回调把整个应用带崩」\n- 修复云同步把删掉的收藏 / 观看历史「复活」：匿名期删过的，登录后会保持删除\n- 快速双击「播放」不再叠出第二个播放器实例（原来旧的整套解码器留在内存里，两边退出时进度互相覆盖）\n\n**二、播放与源**\n\n- 大体积源（约 0.6～2MB）原来「装得上、永远调不通」，现在真正能跑\n- 封面批量加载不再互相拆台（并发时把正在加载的实例销毁，整页灰 12 秒）\n- 抓取页面不再偶发把上一步的旧页面当结果\n- 恢复出厂现在连源缓存、已装源脚本一起清掉\n\n**三、更新体验**\n\n- 「下载更新」不再 45 秒假超时（原来包还在下，界面已经报失败来回跳）\n- 冷启动的更新检查不再偷偷打约 1MB 探速流量\n- 镜像吐错误页不会再把本地待更新清单抹掉\n\n**四、代理与订阅**\n\n- 粘错一条链接不再覆盖存好的节点链接\n- `socks://` 订阅正确识别；缺字段的节点会计数报出来，不再静默消失\n- 测速不再被坏域名的 DNS 卡住几分钟（代价：域名节点暂不显示国旗）\n- `https://` 开头的外部代理串现在明确拒绝（原来接受但按明文用，必然连不上）\n\n**五、安全加固（三项）**\n\n- 页面加上 CSP：前端联网只许走应用桥，注入脚本无法直连外网\n- 本地播放中继加 HMAC 签名：同设备其它应用无法再借用播放通道、带你的出口发请求\n- 源封面的私网校验改为「解析一次、钉死 IP 直连」，封死 DNS rebinding 绕过\n\n**六、顺带**\n\n- 设置页点版本图标不再报错；市场装源加互斥；封面加载失败不再一刀切冻五分钟（网络类 30 秒即可重试）；观看进度存储加上限\n\n说明：前端热更通道已停用，本版前端改动全部随 APK 发。本版未改任何源配置，已装的源无需重新添加。\n\n---\n\nsha256: `573031f74e79d81fbcd3657c2a3dcf69de44e9370f86c6f085caaa64e292c17c`\n大小: 41,023,018 字节（39.1 MB）\n单测 364 条全过（较上版 +53），42 条 JS 钩子断言全过，APK 断言（27 个 JS 全部 ES2017 可解析、dex 1 / so 4 / assets 77）通过。真机（小米 23113RKC6C）冷启动 / 首页 / 起播验证通过。"
+  "sha256": "ccade41f4c8fef29c96751bd5662ac4cce4b11e441b2d6ad3a94c6e1bdaf3d62",
+  "size": 41024382,
+  "notes": "2.0.30：九模块并行深审后的一轮 bug 修复（4 高危 + 6 中危）。挑能感知的说：\n\n一、播放与观看历史\n- 修复「看完最后一部/最后一集，观看历史仍显示没看完」：末集结束时会重置播放态，退出时又把完成标记覆盖掉\n- 修复整部剧连播与单集播放的进度串台：单集进度不再被当成整部剧的某一集去定位/续播\n\n二、埋点与云同步\n- 修复发送失败的单条埋点会被无限重发（进隔离区后仍被写回队列，越积越多直至丢掉新事件）\n- 修复云同步把本地已裁剪掉的历史又合并回来（补上删除墓碑）\n\n三、更新体验\n- 修复「下载更新途中打开设置页，整页点什么都没反应」：查询/回放不再等下载那把锁\n\n四、代理与订阅\n- 修复同一台服务器、仅加密方式或带宽不同的节点被当成重复、被去重吞掉\n\n五、界面\n- 修复详情选集号来自异常源时可能注入/显示 undefined\n- 修复封面加载失败冻结时长分档判据（网络类 30 秒可重试，真坏图 5 分钟）\n- 市场装源加互斥，中途出错不再永久卡在「正在切换源」\n\n---\nsha256: `ccade41f4c8fef29c96751bd5662ac4cce4b11e441b2d6ad3a94c6e1bdaf3d62`\n大小: 41,024,382 字节（39.1 MB）\n单测 393 条全过（较上版 +29），42 条 JS 钩子断言全过，APK 断言（27 个 JS 全部 ES2017 可解析、dex 1 / so 4 / assets 77）通过。"
 }
