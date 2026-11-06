@@ -297,6 +297,114 @@ const PROFILES = {
     },
   },
 
+  // ── 西瓜短剧（uxbu.j4g3wltg.cc，JSON 接口，与黄果同一套后端）───────────
+  //
+  // 夹具全是原始响应，看见的字段就是断言里的字段。三条只有这家才有的坑：
+  //   ① `/api/videos?tag=` 被静默忽略（返回全站），tagList 只能走 SSR 标签页；
+  //   ② 播放有第二条 H.265 线路（video_url_hevc），但不是每集都有；
+  //   ③ 首页接口的 cover 是**相对路径**，列表接口给绝对地址 —— 两条都要能补全。
+  xiguaduanju: {
+    dir: 'xiguaduanju',
+    fixtures: {
+      // play 必须排在 detail 前面：`/api/videos/5033/play?ep=1` 也匹配 detail 那条前缀。
+      'play-5033-ep1.json': /\/api\/videos\/5033\/play\?ep=1$/,
+      'play-5033-ep6.json': /\/api\/videos\/5033\/play\?ep=6$/,
+      'play-5033-ep7.json': /\/api\/videos\/5033\/play\?ep=7$/,
+      'detail-1003.json': /\/api\/videos\/1003$/,
+      'detail-5033.json': /\/api\/videos\/5033$/,
+      // page=2 要排在 page=1 前面，否则 `category/ai-duanju` 那条会先命中。
+      'category-ai-duanju-p2.json': /\/api\/videos\/category\/ai-duanju\?page=2/,
+      'category-ai-duanju.json': /\/api\/videos\/category\/ai-duanju/,
+      'category-ai-manju.json': /\/api\/videos\/category\/ai-manju/,
+      // cate_id 分支（slug 写数字时走这条）。args 里用的是 slug，所以这条没有断言，
+      // 留着是为了 --dump 和手改 args 时能直接跑通，别让人以为夹具缺了。
+      'category-cate24.json': /\/api\/videos\?cate_id=24/,
+      'search.json': /\/api\/search\?/,
+      'tags.json': /\/api\/tags/,
+      'home.json': /\/api\/home/,
+      'list.json': /\/api\/videos\?page=1&size=24/,
+      'tag-houru-p2.html': /\/tag\/houru\/page\/2\//,
+      'tag-houru.html': /\/tag\/houru\//,
+    },
+    checks: {
+      // 夹具实测：featured 8 + latest 8 + cate_rec 4×3 + 全站最新 24，去重后 35。
+      home: [
+        ['卡片 ≥ 30（合并去重后 35）', r => (r.items || []).length >= 30],
+        ['首条是 featured 的第一条（1003）', r => String((r.items || [])[0] && r.items[0].id) === '1003'],
+        ['id 无重复', r => {
+          const ids = (r.items || []).map(one => String(one.id));
+          return ids.length === new Set(ids).size;
+        }],
+        // 首页接口给的是 `/upload_01/…` 相对路径，漏了 PIC 前缀这里就是一片灰。
+        ['封面全是 https 绝对地址', r => (r.items || []).every(one => String(one.cover || '').startsWith('https://'))],
+        ['至少 20 张卡带「N集」角标', r => (r.items || [])
+          .filter(one => /^\d+集$/.test(String(one.badge || ''))).length >= 20],
+        ['不谎报还有下一页', r => r.hasMore === false],
+      ],
+      // 夹具：/api/videos/category/ai-duanju?page=1&size=20，20 条 / 24 页 / 共 465。
+      category: [
+        ['一页 20 条', r => (r.items || []).length === 20],
+        ['角标是 N集', r => /^\d+集$/.test(String((r.items || [])[0] && r.items[0].badge || ''))],
+        ['有下一页（24 页里的第 1 页）', r => r.hasMore === true],
+        ['id 全是数字', r => (r.items || []).every(one => /^\d+$/.test(String(one.id)))],
+      ],
+      // 夹具：/api/search?q=妈&page=1&size=20 → 20 条 / 2 页 / 共 26。
+      search: [
+        ['搜索有结果', r => (r.items || []).length > 0],
+        ['第一页有下一页', r => r.hasMore === true],
+        ['卡片标题非空', r => String((r.items || [])[0] && r.items[0].title || '').length > 0],
+      ],
+      // 夹具：/api/videos/5033，6 集，两条线路。
+      detail: [
+        ['标题对得上', r => String(r.title || '') === '妈妈和姐姐用了我的系统都说好'],
+        ['6 集', r => (r.episodes || []).length === 6],
+        ['第一集 ref 是 ep1', r => String((r.episodes || [])[0] && r.episodes[0].ref) === 'ep1'],
+        // episode_count=6、total_episodes=0；计划集数没填时以已上架为准。
+        ['episodeCount 是 6', r => Number(r.episodeCount) === 6],
+        ['封面在 pic.drleao.cn', r => /^https:\/\/pic\.drleao\.cn\//.test(String(r.cover || ''))],
+        ['两条线路（H.264 / H.265）', r => (r.lines || []).length === 2],
+        ['标签非空', r => Array.isArray(r.tags) && r.tags.length > 0],
+        ['简介非空', r => String(r.description || '').length > 0],
+      ],
+      // 夹具：/api/videos/5033/play?ep=1，两条地址都在。
+      play: [
+        ['是 m3u8 直链', r => /\.m3u8/.test(String(r.url || ''))],
+        ['带 auth_key 签名', r => String(r.url || '').indexOf('auth_key=') >= 0],
+        ['url 落在 alts 里（切线路不换源）', r => (r.alts || []).some(one => one.url === r.url)],
+        ['这一集有 H.265，共 2 条线路', r => (r.alts || []).length === 2],
+        ['episodeNumber 是 1', r => Number(r.episodeNumber) === 1],
+      ],
+      // 夹具：/api/tags → 4 个分区，其中 ai短剧 是空的，实际 45 个标签。
+      tags: [
+        ['45 个标签', r => (r.items || []).length === 45],
+        ['3 个有内容的分区', r => new Set((r.items || []).map(t => String(t.group))).size === 3],
+        ['分区都在配置声明的组里', r => (r.items || []).every(t => {
+          const g = String(t.group);
+          return ['rmtc', 'rsph', 'rqjq'].indexOf(g) >= 0;
+        })],
+        ['slug 非空', r => (r.items || []).every(t => String(t.slug || '').length > 0)],
+      ],
+      // 夹具：/tag/houru/（SSR，共 151 条 / 每页 20）。
+      tagList: [
+        ['一页 20 条', r => (r.items || []).length === 20],
+        ['有下一页（151 条 / 20 一页）', r => r.hasMore === true],
+        ['卡片 id 非空', r => String((r.items || [])[0] && r.items[0].id || '').length > 0],
+        ['封面是 https', r => String((r.items || [])[0] && r.items[0].cover || '').startsWith('https://')],
+        // 这里最容易错的地方：卡片封面在 data-src，src 是占位图。
+        ['封面不是占位图', r => String((r.items || [])[0] && r.items[0].cover || '').indexOf('cover-placeholder') < 0],
+      ],
+    },
+    args: {
+      home: {},
+      category: { slug: 'ai-duanju', page: 1 },
+      search: { keyword: '妈', page: 1 },
+      detail: { ref: '5033' },
+      play: { ref: '5033:ep1', ep: 1 },
+      tags: {},
+      tagList: { slug: 'houru', page: 1 },
+    },
+  },
+
   // ── yarn 3：mrds66（每日大赛，www.mrds66.com）──────────────────────────
   mrds66: {
     dir: 'mrds66',

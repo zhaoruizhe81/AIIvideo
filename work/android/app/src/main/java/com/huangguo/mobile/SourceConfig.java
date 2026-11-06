@@ -758,6 +758,7 @@ final class SourceConfig {
     static boolean has(Context context) {
         return read(context) != null;
     }
+
     /** 读用户配置。没有、读不动、或不是合法 JSON 一律返回 null。 */
     static JSONObject read(Context context) {
         if (context == null) return null;

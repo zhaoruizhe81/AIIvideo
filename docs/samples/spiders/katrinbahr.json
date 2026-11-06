@@ -1,0 +1,84 @@
+{
+  "_note": "黄鹂电影（katrinbahr.com）。服务端渲染的苹果CMS，CF 盾后。spider 源码 katrinbahr.js 要另装（同一份源码已随 APK 内置，见 assets/katrinbahr.js）。",
+  "web": {
+    "spider": "https://149.104.21.177.sslip.io/spiders/katrinbahr.js",
+    "firstPageSize": 24,
+    "pageSize": 24,
+    "categories": {
+      "movie": "电影",
+      "tv": "电视剧",
+      "short": "短剧",
+      "anime": "动漫",
+      "variety": "综艺"
+    },
+    "ui": {
+      "tabs": [
+        { "key": "movie", "label": "电影", "icon": "film" },
+        { "key": "tv", "label": "电视剧", "icon": "tv" },
+        { "key": "short", "label": "短剧", "icon": "sparkle" },
+        { "key": "anime", "label": "动漫", "icon": "star" },
+        { "key": "more", "label": "更多", "icon": "grid" }
+      ],
+      "categoryIds": {
+        "movie": ["movie"],
+        "tv": ["tv"],
+        "short": ["short"],
+        "anime": ["anime"],
+        "more": ["variety"]
+      },
+      "categoryLabels": {
+        "movie": ["电影"],
+        "tv": ["电视剧"],
+        "short": ["短剧"],
+        "anime": ["动漫"],
+        "more": ["综艺"]
+      },
+      "categoryTitles": {
+        "movie": "电影",
+        "tv": "电视剧",
+        "short": "短剧",
+        "anime": "动漫",
+        "more": "更多分类"
+      },
+      "popularTags": [
+        ["movie", "电影"],
+        ["tv", "电视剧"],
+        ["short", "短剧"],
+        ["anime", "动漫"],
+        ["variety", "综艺"]
+      ],
+      "publicPopularTags": [],
+      "tagGroups": [["category", "分类"]]
+    },
+    "shield": {
+      "warmup": "https://www.katrinbahr.com/tv/1.html",
+      "hosts": [
+        "www.katrinbahr.com",
+        "katrinbahr.com",
+        "img.katrinbahr.com"
+      ],
+      "cookie": "https://www.katrinbahr.com/"
+    }
+  },
+  "headers": {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Mobile Safari/537.36",
+    "Referer": "{origin}/"
+  },
+  "cover": {
+    "mode": "plain",
+    "allowedHosts": ["img.katrinbahr.com"]
+  },
+  "http": {
+    "hosts": [
+      "vip.dytt-tvs.com",
+      "hd.kuktxu.com",
+      "play.hhuus.com",
+      "vodcnd16.ajupf.com",
+      "vodcnd17.ajupf.com",
+      "vodcnd16.0jtv2.com",
+      "vodcnd17.0jtv2.com",
+      "v.fengbao14.com"
+    ]
+  },
+  "net": { "declared": true, "proxy": [] }
+}

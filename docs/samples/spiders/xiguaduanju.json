@@ -1,0 +1,139 @@
+{
+  "_note": "西瓜短剧（uxbu.j4g3wltg.cc）。裸 curl + 手机 UA 直接 200，无 CF 挑战、无 cookie、无签名，所以没有 shield 块。内容和黄果短剧是同一套后端（/api/videos/<id>、/api/videos/<id>/play?ep=N、同样的 AES 封面密钥），差别只有两点：分类走 /api/videos/category/<拼音 slug>，以及额外的 H.265 线路。\n① 封面是 AES-CBC 加密图（pic.drleao.cn 返回 binary/octet-stream，不是 JPEG）：key/iv 与黄果同源，第 6 字节被 XOR 过，需要 headerRepair: legacy-xor。\n② 播放是 AES-128 HLS：master 在 yd-hls.hzjvlo.cn，分片和 #EXT-X-KEY 的 crypt.key 在 tp3.drleao.cn —— http.hosts 两个域都要列，漏一个就是「列表能看、一播就报格式不支持」。",
+  "origin": "https://uxbu.j4g3wltg.cc",
+  "headers": {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
+    "Referer": "{origin}/",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+  },
+  "cover": {
+    "mode": "aes-cbc",
+    "transformation": "AES/CBC/NoPadding",
+    "key": "f5d965df75336270",
+    "iv": "97b60374abc2fbe1",
+    "keyEncoding": "text",
+    "checkExtension": true,
+    "headerRepair": "legacy-xor",
+    "bytePatches": [],
+    "allowedHosts": [
+      "pic.drleao.cn"
+    ],
+    "_why": "2026-11-03 实测三张封面（ads/ 与 upload/ 两个目录、jpeg 与 png）：AES-128-CBC/NoPadding 解密后 JPEG 得 ffd8ffe0、PNG 得 89504e470d0a140a —— 正常 PNG 第 6 字节应是 0x1a，这里是 0x14，正是 headerRepair: legacy-xor 修的那一位（0x14 ^ 0x0E = 0x1a）。key/iv 和黄果短剧完全一致，不是碰巧：51cg 用的是同一个 key、另一个 iv（97b60394…），说明这家图床按批次换 iv，以后换站要么改这行、要么看新页面 JS 里的 decryptImage。"
+  },
+  "http": {
+    "_why": "播放层出口。master 在 yd-hls.hzjvlo.cn（/videos5/… 与 /m3m/rr142/m3u8-v5/… 两种路径），分片与 crypt.key 在 tp3.drleao.cn。m3u8 里的分片是带 auth_key 的绝对地址，所以只声明主机、不改写。真机若报「主机不在播放层白名单里：xxx」就把那个名字补进来。",
+    "hosts": [
+      "yd-hls.hzjvlo.cn",
+      "tp3.drleao.cn"
+    ]
+  },
+  "web": {
+    "spider": "https://149.104.21.177.sslip.io/spiders/xiguaduanju.js",
+    "firstPageSize": 24,
+    "pageSize": 24,
+    "categories": {
+      "ai-duanju": "AI成人短剧",
+      "ai-xiguanyuanchuan": "西瓜原创",
+      "ai-manju": "AI成人漫剧",
+      "ai-mogai": "AI魔改"
+    },
+    "ui": {
+      "tabs": [
+        {
+          "key": "ai-duanju",
+          "label": "AI成人短剧",
+          "icon": "film"
+        },
+        {
+          "key": "ai-xiguanyuanchuan",
+          "label": "西瓜原创",
+          "icon": "sparkle"
+        },
+        {
+          "key": "ai-manju",
+          "label": "AI成人漫剧",
+          "icon": "star"
+        },
+        {
+          "key": "ai-mogai",
+          "label": "AI魔改",
+          "icon": "grid"
+        }
+      ],
+      "categoryIds": {
+        "ai-duanju": [
+          "ai-duanju"
+        ],
+        "ai-xiguanyuanchuan": [
+          "ai-xiguanyuanchuan"
+        ],
+        "ai-manju": [
+          "ai-manju"
+        ],
+        "ai-mogai": [
+          "ai-mogai"
+        ]
+      },
+      "categoryLabels": {
+        "ai-duanju": [
+          "AI成人短剧"
+        ],
+        "ai-xiguanyuanchuan": [
+          "西瓜原创"
+        ],
+        "ai-manju": [
+          "AI成人漫剧"
+        ],
+        "ai-mogai": [
+          "AI魔改"
+        ]
+      },
+      "categoryTitles": {
+        "ai-duanju": "AI成人短剧",
+        "ai-xiguanyuanchuan": "西瓜原创",
+        "ai-manju": "AI成人漫剧",
+        "ai-mogai": "AI魔改"
+      },
+      "publicPopularTags": [
+        [
+          "luanlun",
+          "乱伦"
+        ],
+        [
+          "shunv",
+          "熟女"
+        ],
+        [
+          "renqi",
+          "人妻"
+        ],
+        [
+          "juru",
+          "巨乳"
+        ],
+        [
+          "nixi",
+          "逆袭"
+        ]
+      ],
+      "tagGroups": [
+        [
+          "rmtc",
+          "热门题材"
+        ],
+        [
+          "rsph",
+          "热搜排行"
+        ],
+        [
+          "rqjq",
+          "人气剧情"
+        ]
+      ]
+    },
+    "_notes": "分类有两种写法都能过：slug（ai-duanju）走 /api/videos/category/<slug>，纯数字（24）走 /api/videos?cate_id=24。现在 ui 里用的是 slug，和站点导航一致；cate_id 对应关系是 24=AI成人短剧、25=AI成人漫剧、26=西瓜原创、27=AI魔改。"
+  },
+  "net": {
+    "_why": "故意不写 net 块：站点挂在 Cloudflare（LAX 边缘），裸请求实测 200、无挑战，播放 CDN 是境内域（hzjvlo.cn / drleao.cn）。所以跟随 App 的全局代理开关最灵活 —— 用户在国内直连能过，节点用户也不会被硬钉到直连上。真机若出现「首页 45 秒超时」，那才是需要改成 declared + proxy: [\"uxbu.j4g3wltg.cc\"] 的信号（只代理入口域，CDN 仍直连）。"
+  }
+}
