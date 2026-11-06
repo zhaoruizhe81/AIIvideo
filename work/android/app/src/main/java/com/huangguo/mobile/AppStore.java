@@ -485,9 +485,35 @@ final class AppStore {
                 }
             }
         }
-        trimProgress(progress);
+        // 裁剪后超出 50 部的那几部，id 必须进 historyDeleted 墓碑 —— 否则本地裁掉了、
+        // 云端那份还在，下次同步又把它们合并回来（library() 一直这么做，这里原来
+        // 裸调丢弃了返回值，就漏了这一步）。口径与 library() :337-345 一致。
+        Set<String> trimmedIds = trimProgress(progress);
+        JSONObject historyDeleted = mergeTrimmedIntoDeleted(cloudHistoryDeleted, trimmedIds, System.currentTimeMillis());
+        // ⚠ 本行改动者注意：applyCloudSnapshot 到此为止，下面一行之上属于本方法、
+        // 之下紧接 clearHistory()。改动时别在两者之间误留多余的右花括号（会提前
+        // 结束类体，报「需要class/interface/enum」）。
         // bookmarks/bookmarkDeleted 落盘的是合并结果，不再整份照抄云端。
-        this.preferences.edit().putString(scoped("bookmarks"), bookmarks.toString()).putString(scoped(NotificationCompat.CATEGORY_PROGRESS), progress.toString()).putString(scoped("bookmarkDeleted"), cloudBookmarkDeleted == null ? "{}" : cloudBookmarkDeleted.toString()).putString(scoped("historyDeleted"), cloudHistoryDeleted == null ? "{}" : cloudHistoryDeleted.toString()).apply();
+        this.preferences.edit().putString(scoped("bookmarks"), bookmarks.toString()).putString(scoped(NotificationCompat.CATEGORY_PROGRESS), progress.toString()).putString(scoped("bookmarkDeleted"), cloudBookmarkDeleted == null ? "{}" : cloudBookmarkDeleted.toString()).putString(scoped("historyDeleted"), historyDeleted.toString()).apply();
+    }
+
+    /**
+     * 把裁剪裁掉的历史剧集 id 并入墓碑集合（返回新对象，不改入参）。
+     *
+     * <p>云端快照应用后本地 progress 会再 trim 一次到 50 部；这些被裁掉的 id 必须
+     * 记进 historyDeleted，否则云端仍有它们、下次同步又合并回来（云同步复活）。
+     * 与 {@link #library()} 的墓碑口径一致：每个 id 记当时的删除时刻。
+     * 包可见 + 纯 JSON 逻辑，单测直接盯。
+     */
+    static JSONObject mergeTrimmedIntoDeleted(JSONObject deleted, Set<String> trimmedIds, long now) throws Exception {
+        JSONObject merged = deleted == null ? new JSONObject() : new JSONObject(deleted.toString());
+        if (trimmedIds != null) {
+            Iterator<String> trimmed = trimmedIds.iterator();
+            while (trimmed.hasNext()) {
+                merged.put(trimmed.next(), now);
+            }
+        }
+        return merged;
     }
 
     synchronized void clearHistory() {
