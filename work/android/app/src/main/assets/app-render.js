@@ -66,7 +66,15 @@ function renderDetail() {
   content.innerHTML = `<div class="detail-page"><button class="detail-back" type="button" data-back="1">${icon('back')} 返回</button>
     <div class="detail-art"><img data-cover="${esc(data.cover)}" alt=""></div><div class="detail-copy"><h1>${esc(data.title)}</h1><p>${loading ? '正在获取内容…' : `${esc(data.score)} ${esc(data.episodeLabel)}`}</p><p class="detail-description">${esc(data.description || '')}</p>
     <div class="detail-buttons"><button class="detail-play" type="button" data-play="1" ${loading ? 'disabled' : ''}>${loading ? '正在加载…' : '立即播放'}</button><button class="bookmark-button" type="button" data-bookmark="1" aria-label="${state.bookmarked ? '取消收藏' : '收藏'}" ${loading ? 'disabled' : ''}>${state.bookmarked ? '★' : '☆'}</button></div>
-    ${loading ? '<div class="detail-loading" role="status">正在获取选集…</div>' : episodes.length ? `<h2>选集</h2><div class="episode-grid">${episodes.map((item, index) => `<button type="button" data-episode="${item.number}" class="${index === 0 ? 'active' : ''}">${item.number}</button>`).join('')}</div>` : ''}</div></div>`;
+    ${loading ? '<div class="detail-loading" role="status">正在获取选集…</div>' : episodes.length ? `<h2>选集</h2><div class="episode-grid">${episodes.map((item, index) => {
+      // 选集号必须数值化 + esc：REST 路径 adapters.adaptDetail 的 number 是原值，
+      // 源返回含引号/非数字时会破 data-episode 属性（innerHTML 注入面），正常也会
+      // 显示 undefined。data-episode 用严格整数（点击侧 Number() 解析依赖它），
+      // 文本走 esc() 兜住任何残留的异常值。
+      const numberValue = Number(item.number);
+      const episodeNumber = Number.isFinite(numberValue) && numberValue > 0 ? Math.floor(numberValue) : 0;
+      return `<button type="button" data-episode="${episodeNumber}" class="${index === 0 ? 'active' : ''}">${esc(episodeNumber > 0 ? episodeNumber : (item.number ?? ''))}</button>`;
+    }).join('')}</div>` : ''}</div></div>`;
   cover.hydrate();
 }
 
