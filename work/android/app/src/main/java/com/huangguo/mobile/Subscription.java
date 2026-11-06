@@ -279,7 +279,13 @@ final class Subscription {
                 // ProxyCore.sameNode 一致 —— 那边漏比会拿缺参配置重启核心，
                 // 这里漏比会让真节点被去重吞掉。
                 + '|' + node.sni + '|' + node.flow + '|' + node.fingerprint
-                + '|' + node.publicKey + '|' + node.shortId;
+                + '|' + node.publicKey + '|' + node.shortId
+                // method / alterId / security / allowInsecure / upMbps / downMbps
+                // 与 ProxyCore.sameNode 同步补齐：同机同 uuid 仅加密方式（ss method、
+                // vmess security/alterId）或 hy2 上下行带宽不同的，本就是不同节点，
+                // 漏拼会让它们被当重复吞掉。数字/布尔也拼进来，避免不同值碰撞。
+                + '|' + node.method + '|' + node.alterId + '|' + node.security
+                + '|' + node.allowInsecure + '|' + node.upMbps + '|' + node.downMbps;
     }
 
     /**
