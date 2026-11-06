@@ -68,11 +68,14 @@ async function addSourceFromMarket(url) {
     toast('正在切换源，等这一轮结束再选');
     return;
   }
-  marketInstalling = true;
-  // 入口只按住了被点的那颗；这里把整组按住，别的行不再可点。
-  // 「使用中」那颗本来就该 disabled，整页重画时由 renderMarket 恢复。
-  content.querySelectorAll('[data-market-use]').forEach(button => { button.disabled = true; });
+  // 置标志 + 按按钮一起放进 try：这是「一次安装会话」的开始，任一步同步抛错
+  // 都得走下面的 catch 复位，否则 marketInstalling 永远停在 true —— 会话内点
+  // 任何源都被『正在切换源』挡住，页面又不重载，只能刷新才解得开。
   try {
+    marketInstalling = true;
+    // 入口只按住了被点的那颗；这里把整组按住，别的行不再可点。
+    // 「使用中」那颗本来就该 disabled，整页重画时由 renderMarket 恢复。
+    content.querySelectorAll('[data-market-use]').forEach(button => { button.disabled = true; });
     if (window.HGSetup && typeof window.HGSetup.addOneSource === 'function') {
       const one = await window.HGSetup.addOneSource(url);
       if (!one || one.ok === false) throw new Error((one && one.error) || '设置失败');

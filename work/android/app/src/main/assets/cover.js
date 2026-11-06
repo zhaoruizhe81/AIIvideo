@@ -205,12 +205,21 @@
           image.removeAttribute('src');
           poster?.classList.remove('loading');
           poster?.classList.add('fallback');
-          // 冻结分两档：Java 给了字节、字节本身解不开（真坏数据）才值得冻 5 分钟；
-          // 兜底直连炸掉的（fromJava=false）根因是网络 / Java 层那次失败 —— 对密文
-          // 图床直连本来就必炸，按解码失败冻 5 分钟就成了「一次抖动整页灰五分钟」。
-          // c5e396f 在 Java 侧把主机冻结分了档，这里是前端这层的同款口径。
-          const decodeFromJava = error.message === '图片无法解码' && fromJava;
-          image.dataset.retryAfter = String(Date.now() + (decodeFromJava ? 300000 : 30000));
+          // 冻结分两档：Java 明确判定字节坏（解密/验图失败，或给了字节但浏览器解得开
+          // 才叫异常）才值得冻 5 分钟；兜底直连炸掉的（fromJava=false）根因是网络 /
+          // Java 层那次失败 —— 对密文图床直连本来就必炸，按 5 分钟冻就成了「一次抖
+          // 动整页灰五分钟」，只能短冻 30s 等它自己好。
+          //
+          // 判据不能再靠 error.message==='图片无法解码'：那条消息来自浏览器 onerror，
+          // 而 Java 解密失败/图床回错误页时是 get(url) 直接 reject、fromJava 连 true
+          // 都没置上，于是真正该冻 300s 的坏字节反而全落到 30s，300s 档几乎打不到。
+          // 现在分两种情况：
+          //   · fromJava=true   —— Java 给了 data: 字节（它已验过图）。走到 catch 只可能
+          //     是浏览器解码这一步炸了，等价于「字节坏」，冻 300s。
+          //   · fromJava=false  —— get(url) 没拿到字节，降级成原址直连（密文图床必炸）。
+          //     根因是网络/Java 那次失败，短冻 30s。
+          const badBytes = fromJava;
+          image.dataset.retryAfter = String(Date.now() + (badBytes ? 300000 : 30000));
           // 灰块落地了，记一笔（合并上报，见 notePlaceholder）。
           notePlaceholder(error.message);
         }
