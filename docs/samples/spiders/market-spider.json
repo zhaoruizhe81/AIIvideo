@@ -1,5 +1,5 @@
 {
-  "updated": "2026-10-19",
+  "updated": "2026-11-03",
   "_note": "spider 源清单。和 market.json 是两份东西：那份是老用户用的 REST 配置源，这份全是 spider 源 —— 内容由 App 内置的 spider 运行时跑 js 提供，不拼任何 /api 路径。装法：设置页贴本文件地址，勾选后逐条装。每条 url 指向一份源配置 json，配置里的 web.spider 直接写着对应的 js 源码地址，App 会把它一起装上。",
   "sources": [
     {
@@ -61,6 +61,16 @@
       "name": "51吃瓜",
       "desc": "spider · 服务端渲染 / 无需过盾 / 27 个分类 / 封面在脚本参数里 / 播放是 AES-128 的 HLS（H.264 + H.265 两线）",
       "url": "https://149.104.21.177.sslip.io/spiders/51cg.json"
+    },
+    {
+      "name": "星空影视",
+      "desc": "spider · 苹果CMS 自定义模板 / Cloudflare 盾 / 5 个分类 / 播放直给 m3u8",
+      "url": "https://149.104.21.177.sslip.io/spiders/dozagonza.json"
+    },
+    {
+      "name": "西瓜短剧",
+      "desc": "spider · AI成人短剧 / 纯 JSON 接口、不需要过盾 / 4 个频道 / 封面是 AES 密文 / 播放是 AES-128 的 HLS（H.264 常备、H.265 部分有）",
+      "url": "https://149.104.21.177.sslip.io/spiders/xiguaduanju.json"
     }
   ]
 }

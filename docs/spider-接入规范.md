@@ -4,9 +4,11 @@
 
 **适用版本**：App ≥ v1.0.32，spider ABI = `1`（`__spiderSite.requires` 写 `">=1"`）。
 当前开发版本 2.0.19，ABI 仍是 `1`。
-**参考实现**：配置在 `docs/samples/spiders/*.json`（15 份，覆盖接口站/HTML 站/盾后站/
+**参考实现**：配置在 `docs/samples/spiders/*.json`（16 份，覆盖接口站/HTML 站/盾后站/
 网盘站四种形态），对应的源码在 `work/android/app/src/test/resources/spiders/*.js`；
-那批源都跑过离线回归（`node scripts/spider-all-check.js`，当前 14 个源全过），照着改比从零写快。
+那批源都跑过离线回归（`node scripts/spider-all-check.js`，当前 16 个源、15 个配了断言），
+照着改比从零写快。纯 JSON 接口站想看最短的一份，翻 `xiguaduanju.js`（西瓜短剧）——
+它没有一条正则，全是字段搬运。
 
 ---
 
