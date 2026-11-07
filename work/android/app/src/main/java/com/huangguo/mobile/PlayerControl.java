@@ -299,7 +299,12 @@ final class PlayerControl {
         }
         JSONObject config = new JSONObject(raw);
         String url = config.optString("url", "");
-        if (url.length() == 0) return UserSource.fail(out, "没有可播放的地址");
+        // 刷视频（FEED_LIST）形态首条可以不带 url（H-1：地址由原生 __hgNativeEpisode(id,1)
+        // 现取），所以 url 必填校验要放行非空 feedList。真正的空列表保护在
+        // VlcPlayerActivity.readPayloadShape：feedList 过滤后为空会退回单集。
+        org.json.JSONArray feedList = config.optJSONArray("feedList");
+        boolean hasFeedList = feedList != null && feedList.length() > 0;
+        if (url.length() == 0 && !hasFeedList) return UserSource.fail(out, "没有可播放的地址");
         VlcPlayerActivity.start(context, config);
         out.put("ok", true);
         return out;
