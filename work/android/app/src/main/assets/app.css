@@ -5950,3 +5950,20 @@ html[data-theme=dark] .search-history {
     font-variant-numeric: tabular-nums;
     opacity: .65;
 }
+
+/* ── 刷视频态（抖音式竖滑）的 WebView 沉浸壳 ─────────────────────────────
+   竖滑本体是原生全屏 Activity；这里只管原生盖上来之前/之后 WebView 这一层：
+   藏底栏、藏页面顶栏、内容铺满。setRoute 里 route==='feed' 会挂 .route-feed，
+   applyImmersiveShell(true) 再挂 .feed-immersive —— 两条来源任一成立都收起底栏，
+   确保「原生退出但 route 还没归位」的那一帧也不会露出底栏。 */
+#app.route-feed>#dock,
+#app.feed-immersive>#dock {
+    visibility:hidden;
+    pointer-events:none;
+}
+#app.feed-immersive>.app-top {
+    display:none;
+}
+#app.feed-immersive>#scroll {
+    height:100%;
+}

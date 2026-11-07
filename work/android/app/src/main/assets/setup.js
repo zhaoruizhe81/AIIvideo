@@ -22,6 +22,31 @@
   const errorBox = document.getElementById('setup-error');
   const hint = document.getElementById('setup-hint');
 
+  // ── 刷视频模式开关（抖音式竖滑浏览）────────────────────────────────
+  //
+  // 这是**纯前端浏览表现**的偏好，存 localStorage，不走 Java prefs（无冷启前必读、
+  // 无跨进程诉求，不像主题要防闪白）。key 与 T2 的入口判断、T1 拉起保持一致：
+  // 'hgpref:feedMode'，'1' 开 / '0' 关，缺省（没写过）按关。
+  //
+  // 读写器挂到 window（window.HGFeedMode）而不是只留模块内 ——「我的 → 设置 →
+  // 播放器」那段渲染在 app.js（T2 负责），它要读同一份值；把唯一实现放这儿、app.js
+  // 那边只调 window.HGFeedMode.enabled()，避免两处各写一遍默认值/判空口径漂移。
+  const FEED_MODE_KEY = 'hgpref:feedMode';
+
+  function feedModeEnabled() {
+    try { return localStorage.getItem(FEED_MODE_KEY) === '1'; } catch (error) { return false; }
+  }
+
+  function setFeedModeEnabled(on) {
+    const value = on ? '1' : '0';
+    try { localStorage.setItem(FEED_MODE_KEY, value); } catch (error) {}
+    // T2 在 app.js 里挂了这个钩子：开关一变就重画当前浏览页 / 收掉进行中的竖滑。
+    // 没有它也不影响持久化，只是要用户自己退出当前页才看得到变化 —— 所以可选调用。
+    try { if (typeof window.hgFeedModeChanged === 'function') window.hgFeedModeChanged(Boolean(on)); } catch (error) {}
+  }
+
+  window.HGFeedMode = { key: FEED_MODE_KEY, enabled: feedModeEnabled, set: setFeedModeEnabled };
+
   let resolveReady = null;
   const ready = new Promise(resolve => { resolveReady = resolve; });
   let prompting = false;
@@ -450,6 +475,8 @@
      * 再贴一次，两种行为对用户来说是随机出现的。
      */
     addOneSource,
+    /** 刷视频模式开关的读写器（唯一实现，挂出来给 app.js 的设置页/入口判断复用）。 */
+    feedMode: { key: FEED_MODE_KEY, enabled: feedModeEnabled, set: setFeedModeEnabled },
     /** 手动重开设置页（「我的」里的换源入口用）。 */
     open() {
       showError('');
