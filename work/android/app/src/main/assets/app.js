@@ -148,6 +148,61 @@ function savePlayerPrefs(patch) {
   return next;
 }
 
+// ── 刷视频模式：全局开关（纯前端表现层偏好，存 localStorage）──────────────
+// 开关关闭时浏览与点击维持现状（点开 = 进详情 / 单集·整剧连播）；开启时点列表卡片
+// 走抖音式全屏竖滑（拉起原生 FEED_LIST）。设置页 UI 由 T3 挂在 setup/壳 里，通过
+// 这两个函数读写；列表点击分支（本文件）也读 feedModeEnabled()。
+const FEED_MODE_KEY = 'hgpref:feedMode';
+function feedModeEnabled() {
+  try { return localStorage.getItem(FEED_MODE_KEY) === '1'; } catch (error) { return false; }
+}
+function setFeedModeEnabled(on) {
+  try { localStorage.setItem(FEED_MODE_KEY, on ? '1' : '0'); } catch (error) {}
+  // 立即让当前浏览页/设置页按新值重画（T3 若监听此事件就能即时回退）。
+  if (typeof window.hgFeedModeChanged === 'function') {
+    try { window.hgFeedModeChanged(Boolean(on)); } catch (ignored) {}
+  }
+}
+
+/**
+ * 从「当前浏览页」进入刷视频：用 app-feed.js 的 buildFeedContext 组上下文，
+ * 再交给 feed-player 拉起原生。startIndex 是被点卡片在 feedList 里的位置
+ * （按映射后的 id 定位；映射过滤后可能前移/去重，不能直接用 DOM 序号）。
+ *
+ * @param kind  'home' | 'category' | 'listing' | 'search'
+ * @param cardId 被点卡片的 id（用来在映射后的 feedList 里定位起点）
+ */
+function openFeedFrom(kind, cardId) {
+  if (!window.HGFeed || typeof window.HGFeed.buildFeedContext !== 'function') {
+    toast('刷视频模式暂不可用', true);
+    return;
+  }
+  const context = window.HGFeed.buildFeedContext(kind, state);
+  if (!context.items.length) { toast('这一类里没有可刷的视频', true); return; }
+  let index = 0;
+  if (cardId != null) {
+    const at = context.items.findIndex(entry => String(entry.id) === String(cardId));
+    if (at >= 0) index = at;
+  }
+  state.feedReturnContext = null;   // 全新进入，清掉上一次的返回上下文
+  feedPlayer.openFeedList(context, index);
+}
+
+/**
+ * 详情返回续刷（H-5 的前端兜底）：原生自保活是主路径，若原生没能保活（竖滑 Activity
+ * 被销毁），回到详情后由 T3 的返回链路调用这里，用记下的 feedReturnContext 重新拉起
+ * 竖滑并从原位继续。listToken 沿用原会话（不改），以免续页状态错乱。
+ */
+function reopenFeedFromReturn() {
+  const saved = state.feedReturnContext;
+  if (!saved || !saved.context || !saved.context.items.length) return false;
+  state.feedReturnContext = null;
+  feedPlayer.openFeedList(saved.context, Math.max(0, Number(saved.index) || 0));
+  return true;
+}
+window.hgFeedResumeReturn = reopenFeedFromReturn;
+
+
 // 内置播放器到底能不能用（APK 只带了 arm64-v8a）。问一次缓存一页。
 // 这个探测会真的去加载 so —— 45MB 的映射，别反复调。
 function nativePlayerInfo() {
@@ -848,7 +903,17 @@ const state = {
   nativeInfo: null,
   // 内置代理核心的状态 {mode, running, port, host, node, error, effective, ...}；
   // 由 __proxy:status 合成，前端只读不算 —— 见 renderProxySettings 上面那段。
-  proxyCore: null
+  proxyCore: null,
+  // ── 刷视频模式（抖音式竖滑）────────────────────────────────────────
+  // 当前这次竖滑会话的 feed 上下文（app-feed.js buildFeedContext 的产物：items/
+  // listToken/hasMore/nextPage）。续页回调 __hgNativeFeedMore 按 listToken 找它，
+  // 拉回的增量经 __hgNativeFeedAppend 交给原生，不写回 state.category/search/listing。
+  feedContext: null,
+  // 从竖滑「点进详情」时记下来源（{ context, index }），详情返回时前端据此续刷
+  // （原生自保活是主路径，这里是前端重建的兜底）。命名固定，T3 壳/route 复用。
+  feedReturnContext: null,
+  // 是否处于 feedList（跨视频）形态。cleanup() 会清掉。
+  feedListMode: false
 };
 // 子分类下标。state.sub 只预置了内置那套的两个 key，而换源之后 state.tab 是配置
 // 里给的任意 key（苹果CMS 那边是 "1"/"2"/"3"…），取不到就得回 0 —— 不然
@@ -2531,6 +2596,98 @@ window.hgResume = () => {
   }
 };
 
+// ── 刷视频模式：原生 → 前端 的钩子（契约 H-2 / H-4）──────────────────────
+// 原生反射调用这几个 window 函数（evaluateJavascript，同 hgResume 模式）。
+// 前端负责「拉页 → 交回原生」「进详情」；真正的 append/newItemRangeInserted 由原生做。
+//
+// H-2 续页：原生滑近尾且 hasMore 时调 __hgNativeFeedMore(listToken, fromIndex)。
+//   前端按 listToken 找到当前 feedContext，拉下一页 → appendFeedItems 追加（去重）
+//   → 调 __hgNativeFeedAppend(listToken, itemsJson, hasMore) 把增量交回原生。
+//   原生校验 listToken 仍一致才 append（防串台）。同一 listToken 的续页请求做去重，
+//   避免原生反复触发时并发拉同一页。
+const feedMoreInflight = new Set();
+
+// 拉下一页原始 items[]（按来源调对应 api）。返回 { raw, nextPage }。
+async function fetchFeedNextPage(context) {
+  if (!context || context.nextPage == null) return { raw: [], nextPage: null };
+  const page = context.nextPage;
+  if (context.kind === 'category') {
+    const fresh = await api('category', { id: context.id, page });
+    return { raw: asArray(fresh && fresh.items), nextPage: fresh ? fresh.nextPage : null };
+  }
+  if (context.kind === 'listing') {
+    const fresh = await api(context.pageKind, { page, slug: context.slug, label: context.label });
+    return { raw: asArray(fresh && fresh.items), nextPage: fresh ? fresh.nextPage : null };
+  }
+  if (context.kind === 'search') {
+    const fresh = await api('search', { query: context.query, page });
+    return { raw: asArray(fresh && fresh.items), nextPage: fresh ? fresh.nextPage : null };
+  }
+  return { raw: [], nextPage: null };
+}
+
+window.__hgNativeFeedMore = (listToken, fromIndex) => {
+  const context = state.feedContext;
+  // listToken 对不上 = 已经不是这次会话了（换过列表/退出过），丢弃。
+  if (!context || String(context.listToken) !== String(listToken)) return;
+  if (!context.hasMore || context.nextPage == null) {
+    // 没有更多了：明确告诉原生 hasMore=false，让它停止再触发。
+    if (typeof window.__hgNativeFeedAppend === 'function') {
+      window.__hgNativeFeedAppend(String(listToken), '[]', false);
+    }
+    return;
+  }
+  const guard = String(listToken) + ':' + context.nextPage;
+  if (feedMoreInflight.has(guard)) return;   // 同一页已在拉，别并发重复
+  feedMoreInflight.add(guard);
+  fetchFeedNextPage(context).then(({ raw, nextPage }) => {
+    // 回包期间会话可能已被替换 —— 再核一次 listToken。
+    if (!state.feedContext || String(state.feedContext.listToken) !== String(listToken)) return;
+    const added = window.HGFeed.appendFeedItems(context, raw, nextPage);
+    const itemsJson = JSON.stringify(added);
+    if (typeof window.__hgNativeFeedAppend === 'function') {
+      window.__hgNativeFeedAppend(String(listToken), itemsJson, Boolean(context.hasMore));
+    } else {
+      console.log('[feed] 原生未提供 __hgNativeFeedAppend，续页增量未送达：' + added.length + ' 条');
+    }
+  }).catch(error => {
+    console.log('[feed] 续页失败：' + (error && error.message ? error.message : error));
+  }).then(() => {
+    feedMoreInflight.delete(guard);
+  });
+};
+
+// H-2 交回口：前端把续页增量写进 window.__hgNativeFeedQueue[listToken]，原生
+// （VlcPlayerActivity.maybeRequestMoreFeed）轮询读这个队列（读后 delete 并自解析），
+// 拿到 {items:[...], hasMore:bool} 才 append。**必须由前端实现并写队列** —— 原生
+// 不注入本函数，只读队列；写成空占位会让原生永远轮询读不到 → 滑到底不续页。
+// items 是【新增条目数组】，hasMore 是布尔；写对象（不是字符串），原生自己 JSON.stringify。
+window.__hgNativeFeedAppend = function (listToken, itemsJson, hasMore) {
+  try {
+    var items = JSON.parse(itemsJson || '[]');
+    window.__hgNativeFeedQueue = window.__hgNativeFeedQueue || {};
+    window.__hgNativeFeedQueue[String(listToken)] = { items: items, hasMore: !!hasMore };
+  } catch (e) {
+    window.__hgNativeFeedQueue = window.__hgNativeFeedQueue || {};
+    window.__hgNativeFeedQueue[String(listToken)] = { items: [], hasMore: false };
+  }
+};
+
+// H-4 进详情：原生调 hgFeedOpenDetail(id)。前端进详情，并记下来源上下文以便返回续刷。
+window.hgFeedOpenDetail = (id) => {
+  const context = state.feedContext;
+  // 记住当前这次竖滑的来源与「滑到第几条」，详情返回时前端重建的兜底就靠它。
+  if (context) {
+    let index = 0;
+    const at = context.items.findIndex(entry => String(entry.id) === String(id));
+    if (at >= 0) index = at;
+    state.feedReturnContext = { context, index };
+  }
+  // 进详情会离开竖滑（原生保活或退出），先把 feed 态收干净再进详情。
+  feedPlayer.cleanup();
+  goDetail(id);
+};
+
 // ---- 竖屏沉浸流：一屏一集，上下滑切换，自动续播 ----
 // 播放器逻辑已拆到 feed-player.js；app.js 只保留路由入口，避免主文件继续膨胀。
 const feedPlayer = window.HGFeedPlayer.create({
@@ -3132,6 +3289,15 @@ document.addEventListener('click', async event => {
   const card = event.target.closest('[data-open-id]');
   if (card?.dataset.openId) {
     if (card.closest('.hero') && performance.now() < heroSuppressClickUntil) return;
+    // 刷视频模式开启：点列表/首页/分类/搜索里的卡片 → 进抖音式全屏竖滑（拉起原生），
+    // 起点定位到被点的这条。开关关闭时维持现状：进详情（点开=单集/整剧连播）。
+    if (feedModeEnabled()) {
+      const browseKind = state.route === 'home' ? 'home'
+        : state.route === 'category' ? 'category'
+        : state.route === 'listing' ? 'listing'
+        : state.route === 'search' ? 'search' : '';
+      if (browseKind) { openFeedFrom(browseKind, card.dataset.openId); return; }
+    }
     goDetail(card.dataset.openId, card); return;
   }
   // 搜索页的分类胶囊取消了（见 renderSearch 的注释）：它跟搜索词无关，

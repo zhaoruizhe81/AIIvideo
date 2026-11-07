@@ -274,6 +274,9 @@
   <!-- 从 app.js 拆出来的三块。都只在被调用时才碰 DOM 和状态，加载顺序只需要在
        app.js 之前，和 cover.js / adapters.js 一个做法：靠全局作用域通信。 -->
   <script src="model.js"></script>
+  <!-- 刷视频模式映射层（纯函数：列表→feedList、续页追加）。只挂 window.HGFeed，
+       加载期不碰 DOM；必须排在 app.js 之前（app.js 的点击/钩子会用到）。 -->
+  <script src="app-feed.js"></script>
   <script src="app-update.js"></script>
   <script src="source-market.js"></script>
   <script src="proxy-panel.js"></script>

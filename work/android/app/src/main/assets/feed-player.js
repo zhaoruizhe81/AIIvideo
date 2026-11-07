@@ -311,6 +311,7 @@
       observer = null;
       activePage = null;
       currentFeed = null;
+      state.feedListMode = false;
       openToken++;      // 有打开流程（openAt）在路上就作废它，见 alive()
       const feed = document.querySelector('.feed');
       if (feed) {
@@ -494,6 +495,76 @@
       openAt(String(id), Math.max(1, ep))
         .catch(error => toast(error.message || '播放失败，请重试', true))
         .then(() => { opening = false; });
+    }
+
+    /**
+     * 刷视频模式拉起：把一整个「feed 上下文」（跨视频条目序列）交给原生竖滑。
+     *
+     * 与 openAt 的区别：
+     *   · openAt 是**一部剧内**竖滑切集（payload.eps = 该剧集号）。
+     *   · 这里是**跨视频**竖滑（payload.feedList = 多部剧，每部只播第 1 集）。
+     * 契约见 docs/刷视频模式-roadmap.md H-1：feedList 非空即 FEED_LIST 形态；
+     * 首条地址不必带（原生按 id 现取 __hgNativeEpisode(id,1)）；listToken 是本次
+     * 会话身份，原生续页回调 __hgNativeFeedMore(listToken, fromIndex) 靠它归属。
+     *
+     * @param feedContext app-feed.js 的 buildFeedContext 产物（items/listToken/hasMore）
+     * @param startIndex  用户点的是第几条（原生从这条起）
+     */
+    async function openFeedList(feedContext, startIndex) {
+      if (!feedContext || !Array.isArray(feedContext.items) || !feedContext.items.length) {
+        toast('没有可播放的内容', true);
+        return;
+      }
+      if (!window.HG_PLAYER) { toast('这个版本没有带内置播放器', true); return; }
+      if (opening) return;
+      primeBrightness();
+      // 代币：拉起前可能有多段同步准备，用户随时可能返回；cleanup()/close() 会作废它。
+      const token = ++openToken;
+      state.route = 'feed';
+      state.feedListMode = true;
+      state.feedReturnId = feedContext.items[startIndex] ? feedContext.items[startIndex].id : '';
+      // 把当前上下文挂到 state，续页回调（__hgNativeFeedMore）从这里按 listToken 找。
+      state.feedContext = feedContext;
+      const alive = () => token === openToken && state.route === 'feed';
+      content.innerHTML = '<div class="feed-boot">' + esc('正在打开播放器…') + '</div>';
+
+      const index = Math.max(0, Math.min(Number(startIndex) || 0, feedContext.items.length - 1));
+      const first = feedContext.items[index];
+      const prefs = playerPrefs();
+      const payload = {
+        feedList: feedContext.items.map(entry => ({
+          id: entry.id, cover: entry.cover, title: entry.title, source: entry.source || ''
+        })),
+        index,
+        listToken: feedContext.listToken,
+        hasMore: Boolean(feedContext.hasMore),
+        // 起点条目的 id/集号：原生据此先把第 index 条播起来；没有 url 也行（现取）。
+        id: first ? first.id : '',
+        episode: 1,
+        title: first ? first.title : '',
+        cover: first ? first.cover : '',
+        source: window.HG_SOURCE_KEY || (first ? first.source : '') || '',
+        decode: prefs.decode === 'sw' ? 'sw' : 'auto',
+        cache: Number(prefs.cache) || 1500,
+        rate: selectedRate()
+      };
+      opening = true;
+      try {
+        const reply = await window.HG_PLAYER.command('native?payload=' + encodeURIComponent(JSON.stringify(payload)));
+        if (!alive()) return;
+        if (reply && reply.fallback) {
+          boot('这个安装包没有带本机架构的解码库（需要 arm64-v8a）');
+        }
+      } catch (error) {
+        if (alive()) boot(error.message || '内置播放器打不开');
+      } finally {
+        opening = false;
+      }
+    }
+
+    function boot(text) {
+      if (state.route !== 'feed') return;
+      content.innerHTML = '<div class="feed-boot">' + esc(text) + '</div>';
     }
 
     function bindVideo(page) {
@@ -931,6 +1002,15 @@
       if (!session || !session.id) return;
       const id = String(session.id);
       if (!/^\d+$/.test(id)) return;         // 原生那边只认纯数字 id，别的存不了
+
+      // ── 刷视频模式（跨视频竖滑）：只续位置，绝不记观看历史（契约 H-6）──────────
+      // feedList 会话滑走的都是「随手刷过」的片子，不应进观看历史；只有点进详情
+      // 认真看才由详情页正常记录。这里直接返回：不 remember()（本地进度记忆）、
+      // 不 report()（进度上报）。位置由原生自保活维持（H-5），前端不需要动播放头
+      // —— 这个页面里本来就没有 .feed-page（播放全在原生）。
+      if (session.mode === 'feedList') {
+        return;
+      }
 
       const ep = Number(session.episode) || 1;
       const pos = Math.max(0, (Number(session.position) || 0) / 1000);
@@ -1554,7 +1634,7 @@
     // resume：原生 onResume 会调 hgResume()，那里要顺带把内置播放器的现场收回来
     // —— visibilitychange 在 Android WebView 上并不可靠（被 Activity 盖住时
     // document.hidden 常常一直是 false），那条路只当备份。
-    return { open, close, cleanup, resume: () => checkNativeReturn() };
+    return { open, openFeedList, close, cleanup, resume: () => checkNativeReturn() };
   }
 
   window.HGFeedPlayer = { create: createFeedPlayer };
