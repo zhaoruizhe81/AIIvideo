@@ -178,6 +178,20 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
     /** 续页请求在飞：去重，避免同一次滑到底重复问前端。 */
     private boolean feedMorePending;
 
+    /**
+     * 已解出的圆形封面头像 Bitmap 缓存（id → Bitmap）。封面是 AES 加密的，要经前端
+     * __hgFeedCoverData 解密回 data URL 才拿得到；切回同一条不必重复反射解密。上限按
+     * LRU 收口（120 条，约与正常浏览规模同量级；超了丢最旧）。
+     */
+    private final java.util.LinkedHashMap<String, android.graphics.Bitmap> coverCache =
+            new java.util.LinkedHashMap<String, android.graphics.Bitmap>(16, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<String, android.graphics.Bitmap> e) {
+                    return size() > 120;
+                }
+            };
+    /** 某条封面正在后台取：去重，避免连续 activate 同条重复反射。 */
+    private final java.util.Set<String> coverLoading = new java.util.HashSet<String>();
+
     /** FEED_LIST 一页的最小描述。包内可见（字段 package-private）以便单测直接构造。 */
     static final class FeedItem {
         final String id;
@@ -923,8 +937,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
     @Override public void onBackPressed() {
         // 锁着的时候返回键不退出 —— 误触锁的一大半用途就是防这个。
         if (locked) {
-            controls.showHint("已锁定 · 连点两次小锁解锁");
-            controls.hideHintAfter(1500);
+            controls.flashLockPrompt();
             return;
         }
         if (feedMode) persistFeedProgress();
@@ -997,6 +1010,8 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         @Override public void onScrubEnd() { ui.postDelayed(hideControls, HIDE_CONTROLS_MS); }
         @Override public int durationMs() { return (int) durationMs; }
         @Override public void onLockToggle() { setLocked(!locked); }
+        @Override public void onOpenDetail() { openFeedDetail(); }
+        @Override public void onToggleBookmark() { toggleFeedBookmark(); }
     }
 
     /**
@@ -1016,10 +1031,13 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         controls.setLocked(value);
         ui.removeCallbacks(hideControls);
         if (value) {
-            controls.showHint("已锁定 · 连点两次小锁解锁");
+            // 锁上：立刻浮现小锁+提示，约 2 秒后自动淡出（屏幕平时干净）。
+            controls.flashLockPrompt();
         } else {
             controls.showHint("已解锁");
             setControlsVisible(true);
+            // 解锁后把右侧竖排入口放回来（刷视频才显示）。
+            controls.showRightRail(feedListMode);
         }
         controls.hideHintAfter(1800);
     }
@@ -1075,8 +1093,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                         if (e.getActionMasked() == MotionEvent.ACTION_UP) {
                             float dx = e.getX() - downX, dy = e.getY() - downY;
                             if (Math.abs(dx) < dp(TOUCH_SLOP_DP) && Math.abs(dy) < dp(TOUCH_SLOP_DP)) {
-                                controls.showHint("已锁定 · 连点两次小锁解锁");
-                                controls.hideHintAfter(1500);
+                                controls.flashLockPrompt();
                             }
                         }
                         if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
@@ -1117,8 +1134,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                         if (e.getActionMasked() == MotionEvent.ACTION_UP) {
                             float dx = e.getX() - downX, dy = e.getY() - downY;
                             if (Math.abs(dx) < dp(TOUCH_SLOP_DP) && Math.abs(dy) < dp(TOUCH_SLOP_DP)) {
-                                controls.showHint("已锁定 · 连点两次小锁解锁");
-                                controls.hideHintAfter(1500);
+                                controls.flashLockPrompt();
                             }
                         }
                         return;
@@ -1160,6 +1176,8 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                 });
         setContentView(root);
         controls.setVisible(true);
+        // 右侧竖排入口只在刷视频（FEED_LIST）形态出现；单集/SERIES 不显示。
+        controls.showRightRail(feedListMode);
     }
     private void setControlsVisible(boolean visible) {
         controls.setVisible(visible);
@@ -1184,6 +1202,15 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
     private int downVolume, maxVolume;
 
     private boolean onRootTouch(MotionEvent event) {
+        // root（父 FrameLayout）的 OnTouchListener 在 dispatch 阶段先于子 View 收到事件；
+        // 对 DOWN 返回 true 会消费掉整条事件，子按钮（右侧头像/收藏、左上锁）就点不到。
+        // 所以 DOWN 先做命中判断：按在某个「可见的 overlay 按钮」上就 return false 放行。
+        // 坐标口径统一：getRawX/Y（屏幕）配 getGlobalVisibleRect（屏幕）。
+        if (event.getActionMasked() == MotionEvent.ACTION_DOWN
+                && controls.hitOverlayButton((int) event.getRawX(), (int) event.getRawY())) {
+            // 不消费、不记手势状态 —— 让子 View 正常拿到这次点击。
+            return false;
+        }
         if (locked) {
             if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
                 downX = event.getX(); downY = event.getY(); downAt = System.currentTimeMillis();
@@ -1192,8 +1219,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                 float dx = event.getX() - downX, dy = event.getY() - downY;
                 if (Math.abs(dx) < dp(TOUCH_SLOP_DP) && Math.abs(dy) < dp(TOUCH_SLOP_DP)
                         && System.currentTimeMillis() - downAt < 300) {
-                    controls.showHint("已锁定 · 连点两次小锁解锁");
-                    controls.hideHintAfter(1500);
+                    controls.flashLockPrompt();
                 }
             }
             return true;
@@ -1762,6 +1788,10 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         if (pos == curPos && playerFor(pos) != null && playerFor(pos) == activeFeedPlayer) return;
         curPos = pos;
         updateEpisodeUi();
+        // 换到新的一条：刷新收藏星标（FEED_LIST 才做；非 feedList 内部直接返回）。
+        refreshBookmarkState();
+        // 同步刷新右侧圆形封面头像（随刷到哪条变）。
+        refreshRailCover();
         // 落盘不在这儿做：此刻 activeFeedPlayer 还指着上一集的 player，会写出
         // 「新集号 + 旧集位置」的记录。挪到 playPage 认领完新 player 之后（两条
         // 播放路径里各一次）。
@@ -2193,6 +2223,261 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         } catch (Throwable e) {
             return 0;
         }
+    }
+
+    // ── 右侧两入口（刷视频）：进详情 / 收藏★（反射前端钩子）──────────
+    //
+    // 与 rev-m6m8 约定：__hgFeedBookmarkState/__hgFeedToggleBookmark 均**同步返回布尔**
+    // （前端返回原生 true/false，这里用 parseBool 兜 'true'/'false'/true/false）。
+    // 取不到函数/抛错一律兜 false，绝不崩、绝不阻塞。
+
+    /** 反射调 window.hgFeedOpenDetail(id) 进该视频详情/主页（H-4，前端已有）。 */
+    /**
+     * 反射调 window.hgFeedOpenDetail(id) 进该视频详情/主页（H-4，前端已有）。
+     *
+     * <p>前端钩子只在 WebView 里切页面，**不会**让原生 Activity 退出 —— 必须这里自己
+     * 收尾：等前端同步回执（askPageOnce 闩锁拿到 'ok'）后，先落进度、停播、再 finish()，
+     * 把前台还给 MainActivity 露出 WebView 详情页。
+     *
+     * <p>顺序很关键：先 {@link #persistFeedProgress()}（否则进度丢）→ 停 player
+     * （暂停+静音；真正 release 交给 onDestroy，避免这里先把 activeFeedPlayer 置空后
+     * onDestroy 再落盘把位置覆盖成 0）→ finish()。
+     *
+     * <p>不调 onBackPressed：那是「退回原位续刷」的语义，这里要的是 finish 显示 WebView
+     * 详情。返回续刷靠前端兜底（hgFeedOpenDetail 已记 feedReturnContext，返回时前端
+     * returnFromDetail 重拉）——WebView 存活于 MainActivity，finish 不清理那些前端状态。
+     */
+    private void openFeedDetail() {
+        final String id = pageVideoId(curPos);
+        if (id == null || id.length() == 0) return;
+        new Thread(new Runnable() {
+            @Override public void run() {
+                // askPageOnce 同步等 onReceiveValue 回执，拿到 'ok' 再收尾，防 finish 太快回执还没送达。
+                askPageOnce("(function(){try{var f=window.hgFeedOpenDetail;"
+                        + "if(typeof f==='function')f(" + JSONObject.quote(id) + ");"
+                        + "}catch(e){}return 'ok';})()");
+                ui.post(new Runnable() {
+                    @Override public void run() {
+                        leaveToWebDetail();
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** 让出前台给 WebView 详情页：落进度 → 停播（不 release，release 归 onDestroy）→ finish。 */
+    private void leaveToWebDetail() {
+        if (!canLeaveToWebDetail(isFinishing(), isDestroyed())) return;
+        // 1) 先落进度（activeFeedPlayer 此刻仍活着，getTime 是真位置）。
+        persistFeedProgress();
+        // 2) 停播：暂停+静音，别让声音跟着 finish 后的一小段继续响。
+        //    不置空 activeFeedPlayer / 不 releaseFeedPlayers —— 否则 onDestroy 再落盘会把位置写成 0。
+        try {
+            if (activeFeedPlayer != null) {
+                try { activeFeedPlayer.setVolume(0); } catch (Throwable ignored) {}
+                try { if (activeFeedPlayer.isPlaying()) activeFeedPlayer.pause(); } catch (Throwable ignored) {}
+            }
+            if (player != null) {
+                try { if (player.isPlaying()) player.pause(); } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+        // 3) 退出本 Activity，露出 MainActivity 里的 WebView 详情页。onDestroy 再兜底
+        //    persistFeedProgress()（位置不变）+ releaseFeedPlayers() 收资源。
+        finish();
+    }
+
+    /**
+     * 是否还该执行「让出前台」的收尾：正在结束 / 已销毁就不做（防重复 finish、防
+     * Activity 已死时再 touch player）。纯函数，单测钉。
+     */
+    static boolean canLeaveToWebDetail(boolean finishing, boolean destroyed) {
+        return !finishing && !destroyed;
+    }
+
+    /**
+     * 点收藏★：反射调 window.__hgFeedToggleBookmark(id)，用其同步返回的新状态刷新星标。
+     *
+     * <p>前端做乐观翻转并同步返回新值（详见与 rev-m6m8 的约定）；失败它会回滚缓存，
+     * 下次 {@link #refreshBookmarkState} 复读会纠正。
+     */
+    private void toggleFeedBookmark() {
+        final String id = pageVideoId(curPos);
+        if (id == null || id.length() == 0) return;
+        final int pos = curPos;
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final String raw = askPageOnce("(function(){try{var f=window.__hgFeedToggleBookmark;"
+                        + "return (typeof f==='function')?String(!!f(" + JSONObject.quote(id) + ")):'false';"
+                        + "}catch(e){return 'false';}})()");
+                final boolean on = parseBool(raw, false);
+                ui.post(new Runnable() {
+                    @Override public void run() {
+                        // 只在还是同一页时才回填，防串台（滑走了就别改别人星标）。
+                        if (pos == curPos && id.equals(pageVideoId(curPos)) && controls != null) {
+                            controls.setBookmarked(on);
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /**
+     * 进入某条时刷新收藏星标：先读 state；若前端说缓存未就绪，约 250ms 后复读一次。
+     *
+     * <p>竞态防护：回填前校验仍是同一页（pos/id），滑走/换列表的旧回包丢弃。
+     */
+    private void refreshBookmarkState() {
+        if (!feedListMode || controls == null) return;
+        final String id = pageVideoId(curPos);
+        if (id == null || id.length() == 0) return;
+        final int pos = curPos;
+        new Thread(new Runnable() {
+            @Override public void run() {
+                boolean on = readBookmarkState(id);
+                // 缓存未热（前端首次可能返回 false）：约 250ms 后复读一次兜底。
+                String ready = askPageOnce("(function(){try{var f=window.__hgFeedBookmarkReady;"
+                        + "return (typeof f==='function')?String(!!f(" + JSONObject.quote(id) + ")):'true';"
+                        + "}catch(e){return 'true';}})()");
+                if (!parseBool(ready, true)) {
+                    try { Thread.sleep(250); } catch (InterruptedException e) { return; }
+                    if (pos == curPos) on = readBookmarkState(id);
+                }
+                final boolean result = on;
+                ui.post(new Runnable() {
+                    @Override public void run() {
+                        if (pos == curPos && id.equals(pageVideoId(curPos)) && controls != null) {
+                            controls.setBookmarked(result);
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    // ── 右侧圆形封面头像：反射取解密后的封面 data URL，解码显示 ─────────
+    //
+    // 封面是 AES 加密的，原生拿不到明文；经前端 __hgFeedCoverData(id) 同步返回
+    // 'data:image/jpeg;base64,...'（未就绪/失败返回 ''），这里 Base64 解码成 Bitmap
+    // 显示在圆形头像里。缓存已解 Bitmap，切回同条不重复解密。失败一律纯色圆兜底。
+
+    /** activate 某条时刷新右侧圆形封面头像。 */
+    private void refreshRailCover() {
+        if (!feedListMode || controls == null) return;
+        final String id = pageVideoId(curPos);
+        if (id == null || id.length() == 0) {
+            controls.setRailCover(null);
+            return;
+        }
+        // 缓存命中：直接显示（切回同条不重复解密）。
+        android.graphics.Bitmap cached = coverCache.get(id);
+        if (cached != null && !cached.isRecycled()) {
+            controls.setRailCover(cached);
+            return;
+        }
+        // 这条没有封面 URL 也试着问一次（前端解码链路自带兜底）；先显纯色圆。
+        controls.setRailCover(null);
+        if (coverLoading.contains(id)) return;   // 已在取，去重
+        coverLoading.add(id);
+        final int pos = curPos;
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    android.graphics.Bitmap bmp = decodeCoverData(readCoverData(id));
+                    // 未就绪（'' 解不出）：若前端说没 ready，300ms 再复读一次兜底。
+                    if (bmp == null) {
+                        String ready = askPageOnce("(function(){try{var f=window.__hgFeedCoverReady;"
+                                + "return (typeof f==='function')?String(!!f(" + JSONObject.quote(id) + ")):'true';"
+                                + "}catch(e){return 'true';}})()");
+                        if (!parseBool(ready, true) && pos == curPos) {
+                            try { Thread.sleep(300); } catch (InterruptedException e) { return; }
+                            bmp = decodeCoverData(readCoverData(id));
+                        }
+                    }
+                    final android.graphics.Bitmap result = bmp;
+                    if (result != null) coverCache.put(id, result);
+                    ui.post(new Runnable() {
+                        @Override public void run() {
+                            // 回填前校验仍是同一页（防串台），且在取集合里摘除。
+                            if (controls != null && pos == curPos && id.equals(pageVideoId(curPos))) {
+                                controls.setRailCover(result);
+                            }
+                        }
+                    });
+                } finally {
+                    ui.post(new Runnable() {
+                        @Override public void run() { coverLoading.remove(id); }
+                    });
+                }
+            }
+        }).start();
+    }
+
+    /** 反射读一次 window.__hgFeedCoverData(id)；缺函数/错→'' 空串。 */
+    private String readCoverData(String id) {
+        return askPageOnce("(function(){try{var f=window.__hgFeedCoverData;"
+                + "return (typeof f==='function')?(String(f(" + JSONObject.quote(id) + ")||'')):'';"
+                + "}catch(e){return '';}})()");
+    }
+
+    /**
+     * 把前端给的 data URL / 裸 base64 解成 Bitmap。空串/解不出返回 null（调用方兜纯色圆）。
+     * 包内可见：单测可直接喂脏数据验证不崩、以及 base64 载荷截取。
+     */
+    static android.graphics.Bitmap decodeCoverData(String data) {
+        try {
+            String b64 = base64PayloadOf(data);
+            if (b64 == null || b64.length() == 0) return null;
+            byte[] bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT);
+            if (bytes == null || bytes.length == 0) return null;
+            return android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    /**
+     * 从 'data:image/jpeg;base64,XXXX' 里截出 base64 载荷；也兼容裸 base64（无逗号前缀）。
+     * 纯函数，单测钉。空/无载荷返回 null。
+     */
+    static String base64PayloadOf(String data) {
+        if (data == null) return null;
+        String s = data.trim();
+        if (s.length() == 0) return null;
+        int comma = s.indexOf(',');
+        if (s.regionMatches(true, 0, "data:", 0, 5)) {
+            // data URL：取第一个逗号之后的载荷；没有逗号视为无效。
+            if (comma < 0) return null;
+            return s.substring(comma + 1);
+        }
+        return s;   // 裸 base64
+    }
+
+    /** 读一次 window.__hgFeedBookmarkState(id)，解析布尔（缺函数/错→false）。 */
+    private boolean readBookmarkState(String id) {
+        String raw = askPageOnce("(function(){try{var f=window.__hgFeedBookmarkState;"                + "return (typeof f==='function')?String(!!f(" + JSONObject.quote(id) + ")):'false';"
+                + "}catch(e){return 'false';}})()");
+        return parseBool(raw, false);
+    }
+
+    /**
+     * 解析前端返回的布尔字符串：'true'/'false'（原始 true/false 也行），其余取 fallback。
+     * 纯函数，单测直接钉。
+     */
+    static boolean parseBool(String raw, boolean fallback) {
+        if (raw == null) return fallback;
+        String s = raw.trim();
+        if ("true".equalsIgnoreCase(s)) return true;
+        if ("false".equalsIgnoreCase(s)) return false;
+        return fallback;
+    }
+
+    /**
+     * 收藏状态「要不要延时复读一次」的判据：前端说缓存未就绪（ready=false）时复读一次兜底。
+     * 纯函数，单测钉住「未就绪才复读」这条决策，避免首帧恒灭或无限轮询。
+     */
+    static boolean bookmarkNeedsReread(boolean ready) {
+        return !ready;
     }
 
     private long resumeOf(int pos) {

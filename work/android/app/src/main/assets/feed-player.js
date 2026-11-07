@@ -522,9 +522,22 @@
       const token = ++openToken;
       state.route = 'feed';
       state.feedListMode = true;
+      // 记下当前起点 index：详情返回续刷时按它回到原位（rememberFeedReturnContext 读它）。
+      state.feedIndex = Math.max(0, Number(startIndex) || 0);
       state.feedReturnId = feedContext.items[startIndex] ? feedContext.items[startIndex].id : '';
       // 把当前上下文挂到 state，续页回调（__hgNativeFeedMore）从这里按 listToken 找。
       state.feedContext = feedContext;
+      // 预热收藏状态缓存：原生右侧星标进入某条时会同步问 __hgFeedBookmarkState(id)，
+      // 而查收藏是异步 api。这里先把起点及相邻几条的收藏状态后台查好塞缓存，把
+      // 「首次 activate 恒 false」的窗口压到最小。实现与缓存都在 app.js。
+      if (typeof window.__hgFeedWarmBookmarks === 'function') {
+        try { window.__hgFeedWarmBookmarks(feedContext.items, startIndex); } catch (ignored) {}
+      }
+      // 预热圆形封面头像的解密数据：原生右侧头像进入某条时会同步问 __hgFeedCoverData(id)，
+      // 而解密是异步的。这里先把起点及相邻几条的封面后台解好塞缓存，尽量让首次就命中。
+      if (typeof window.__hgFeedWarmCovers === 'function') {
+        try { window.__hgFeedWarmCovers(feedContext.items, startIndex); } catch (ignored) {}
+      }
       const alive = () => token === openToken && state.route === 'feed';
       content.innerHTML = '<div class="feed-boot">' + esc('正在打开播放器…') + '</div>';
 

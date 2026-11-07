@@ -189,18 +189,37 @@ function openFeedFrom(kind, cardId) {
 }
 
 /**
- * 详情返回续刷（H-5 的前端兜底）：原生自保活是主路径，若原生没能保活（竖滑 Activity
- * 被销毁），回到详情后由 T3 的返回链路调用这里，用记下的 feedReturnContext 重新拉起
- * 竖滑并从原位继续。listToken 沿用原会话（不改），以免续页状态错乱。
+ * 由「详情返回快照」（app-route.js takeFeedReturnContext 的产物）重建 feed 上下文并
+ * 重新拉起竖滑，滑到原位。快照是 slim 版：items 是 [{id,cover,title,source}]，
+ * 外加 listToken/kind/hasMore/nextPage/query/slug/label/pageKind/categoryId/feedIndex。
+ * 这些正好够 openFeedList 组 payload 与后续续页；listToken 沿用原会话，避免续页乱。
+ *
+ * @return true 表示已重拉续刷；false 表示没有可用的快照。
  */
-function reopenFeedFromReturn() {
-  const saved = state.feedReturnContext;
-  if (!saved || !saved.context || !saved.context.items.length) return false;
-  state.feedReturnContext = null;
-  feedPlayer.openFeedList(saved.context, Math.max(0, Number(saved.index) || 0));
+function resumeFeedFromSaved(saved) {
+  if (!saved || !Array.isArray(saved.items) || !saved.items.length) return false;
+  const context = {
+    kind: String(saved.kind || ''),
+    items: saved.items.map(entry => ({
+      id: String(entry.id || ''),
+      cover: String(entry.cover || ''),
+      title: String(entry.title || ''),
+      source: String(entry.source || '')
+    })),
+    listToken: String(saved.listToken || ''),
+    hasMore: Boolean(saved.hasMore),
+    nextPage: saved.nextPage == null ? null : Number(saved.nextPage)
+  };
+  // 续页请求要带的来源参数原样带上（category 用 id，listing 用 pageKind/slug/label，search 用 query）。
+  if (saved.query) context.query = saved.query;
+  if (saved.slug) context.slug = saved.slug;
+  if (saved.label) context.label = saved.label;
+  if (saved.pageKind) context.pageKind = saved.pageKind;
+  if (saved.categoryId != null) context.id = saved.categoryId;
+  const index = Math.max(0, Math.min(Number(saved.feedIndex) || 0, context.items.length - 1));
+  feedPlayer.openFeedList(context, index);
   return true;
 }
-window.hgFeedResumeReturn = reopenFeedFromReturn;
 
 
 // 内置播放器到底能不能用（APK 只带了 arm64-v8a）。问一次缓存一页。
@@ -2012,6 +2031,16 @@ function renderPlayerSettings() {
     <button type="button" class="listing-back" data-back="1">${icon('back')} 返回设置</button>
     <h1>播放器</h1>
 
+    <section class="settings-card" aria-label="刷视频">
+      <div class="settings-row is-static">
+        <span class="settings-icon">${icon('play')}</span>
+        <span class="settings-body"><strong>刷视频模式</strong><small>开启后点列表里的卡片进入抖音式上下滑刷视频，关闭则维持普通浏览。</small></span>
+      </div>
+      <div class="settings-row is-action">
+        ${seg('feedMode', [['0', '关'], ['1', '开']], feedModeEnabled() ? '1' : '0')}
+      </div>
+    </section>
+
     <section class="settings-card" aria-label="解码">
       <div class="settings-row is-static">
         <span class="settings-icon">${icon('player')}</span>
@@ -2553,7 +2582,19 @@ window.hgBack = () => {
   if (state.route === 'cover-diagnostics') { restoreScreen(state.coverDiagReturn); return true; }
   if (state.route === 'market') { restoreScreen(state.marketReturn); return true; }
   if (state.route === 'settings') { restoreScreen(state.settingsReturn); return true; }
-  if (state.route === 'detail') { if (detailCard) detailCard.close(); else returnFromDetail(); return true; }
+  if (state.route === 'detail') {
+    // 从刷视频竖滑点「进详情」进来的：返回时不是回普通上一页，而是**重拉竖滑续刷到原位**。
+    // takeFeedReturnContext 会读落盘快照（抗进程回收），取到就重拉；取不到/null 按普通返回走。
+    let savedFeed = null;
+    if (typeof takeFeedReturnContext === 'function') savedFeed = takeFeedReturnContext();
+    if (savedFeed) {
+      // 先把即将被 detailCard.close()/returnFromDetail() 覆盖的详情态收干净，
+      // 再由 resumeFeedFromSaved 重拉——openFeedList 内部会设 state.route='feed'。
+      if (detailCard) { try { detailCard.dispose(); } catch (ignored) {} detailCard = null; }
+      if (resumeFeedFromSaved(savedFeed)) return true;
+    }
+    if (detailCard) detailCard.close(); else returnFromDetail(); return true;
+  }
   if (state.route === 'listing' && state.listing?.kind === 'tag-list') { restoreScreen(state.listingReturn); return true; }
   if (state.route === 'tags') { restoreScreen(state.tagsReturn); return true; }
   if (state.route === 'listing') { goHome(); return true; }
@@ -2673,16 +2714,168 @@ window.__hgNativeFeedAppend = function (listToken, itemsJson, hasMore) {
   }
 };
 
+// ── 迭代2-B：原生右侧「收藏★」的前端钩子（与 rev-m2m3 约定，同步返回布尔）──
+// 原生用 askPageOnce 同步 evaluateJavascript 取值，所以这两个钩子**必须同步返回
+// 布尔**（不能 Promise）。查收藏是异步 api，这里维护 window.__hgFeedBookmarkCache
+// （id → bool）作同步读源：拉起竖滑时后台预热、命中即用、未命中返回 false 并后台补查。
+// 缓存/就绪集都挂 window（跨 Activity 存活）。
+window.__hgFeedBookmarkCache = window.__hgFeedBookmarkCache || {};   // id → 是否已收藏
+window.__hgFeedBookmarkReadySet = window.__hgFeedBookmarkReadySet || {};   // id → 缓存是否已就绪
+
+// 后台查一条收藏状态写缓存。返回 Promise（调用方可不 await）。
+function warmFeedBookmark(id) {
+  const key = String(id);
+  if (window.__hgFeedBookmarkReadySet[key]) return Promise.resolve(window.__hgFeedBookmarkCache[key]);
+  return api('bookmark-state', { id: key }).then(value => {
+    // api('bookmark-state') 可能返回 bool 或 {bookmarked}，两种都认。
+    const on = (value && typeof value === 'object') ? Boolean(value.bookmarked) : Boolean(value);
+    window.__hgFeedBookmarkCache[key] = on;
+    window.__hgFeedBookmarkReadySet[key] = true;
+    return on;
+  }).catch(() => false);
+}
+
+// 预热：把起点及相邻若干条的收藏状态后台查好（原生滑到附近时缓存已就绪）。
+// 由 feed-player 的 openFeedList 在挂上 state.feedContext 后调用。
+window.__hgFeedWarmBookmarks = function (items, startIndex) {
+  const list = asArray(items);
+  const start = Math.max(0, Number(startIndex) || 0);
+  const end = Math.min(list.length, start + 6);            // 起点往后 6 条足够覆盖先刷的几条
+  for (let i = start; i < end; i += 1) {
+    if (list[i] && list[i].id != null) warmFeedBookmark(list[i].id);
+  }
+};
+
+// 原生进入某条时同步问：该视频是否已收藏。缓存未命中 → 返回 false 并后台补查
+// （下一次 activate 或延后复读就能拿到真值）。
+window.__hgFeedBookmarkState = function (id) {
+  const key = String(id);
+  if (window.__hgFeedBookmarkReadySet[key]) return Boolean(window.__hgFeedBookmarkCache[key]);
+  warmFeedBookmark(key);                                    // 补查，不阻塞本次同步返回
+  return Boolean(window.__hgFeedBookmarkCache[key]);        // 未就绪时是 false/undefined → false
+};
+
+// 原生进入某条时同步问：该 id 的收藏缓存是否已就绪（'true'/'false' 字符串亦可）。
+// 原生据此决定「直接用 state」还是「约 250ms 后复读一次 state」。
+window.__hgFeedBookmarkReady = function (id) {
+  return Boolean(window.__hgFeedBookmarkReadySet[String(id)]);
+};
+
+// 原生点「收藏★」时同步切换：乐观翻转缓存并同步返回新布尔；后台发 api('bookmark')，
+// 成功用服务端值覆盖、失败回滚。detail 从 feedContext 条目组最小载荷；拿不到就查详情。
+window.__hgFeedToggleBookmark = function (id) {
+  const key = String(id);
+  const before = Boolean(window.__hgFeedBookmarkCache[key]);
+  const next = !before;
+  // 乐观更新：立刻让原生星标跟着翻，不等网络。
+  window.__hgFeedBookmarkCache[key] = next;
+  window.__hgFeedBookmarkReadySet[key] = true;
+  const item = (state.feedContext && Array.isArray(state.feedContext.items))
+    ? state.feedContext.items.find(entry => String(entry.id) === key) : null;
+  const detail = item
+    ? {
+        id: key,
+        title: item.title || '',
+        cover: item.cover || '',
+        source: item.source || window.HG_SOURCE_KEY || ''
+      }
+    : null;
+  const run = detail
+    ? api('bookmark', detail)
+    : api('detail', { id: key }).then(real => api('bookmark', real));
+  run.then(value => {
+    const on = (value && typeof value === 'object') ? Boolean(value.bookmarked) : Boolean(value);
+    // 服务端返回的才是真相（比如删除后返回 false），覆盖乐观值。
+    window.__hgFeedBookmarkCache[key] = on;
+    window.__hgFeedBookmarkReadySet[key] = true;
+    // 若此刻正停在原生竖滑，把最终值同步给原生刷新星标（原生提供则调）。
+    if (typeof window.__hgNativeBookmarkUpdated === 'function') {
+      try { window.__hgNativeBookmarkUpdated(key, on); } catch (ignored) {}
+    }
+  }).catch(() => {
+    // 失败回滚缓存，下一次 __hgFeedBookmarkState 复读会纠正星标。
+    window.__hgFeedBookmarkCache[key] = before;
+  });
+  return next;      // 同步返回切换后的新布尔（原生立即更新星标）
+};
+
+// ── 迭代2-C：原生圆形封面头像的解密数据钩子（与 rev-m2m3 约定，同步返回字符串）──
+// 原生 askPageOnce 同步取值，所以 __hgFeedCoverData(id) **必须同步返回字符串**：
+//   已就绪 → 'data:image/...;base64,...'；未就绪/无封面/解密失败 → ''（原生兜纯色圆）。
+// 解密是异步（cover.get(url) → api('cover') → Java 解密），故用缓存：
+//   window.__hgFeedCoverCache[id] = 'data:...' | ''（只存有效 data: 串）
+//   window.__hgFeedCoverReadySet[id] = true（该 id 已解过一次，命中即用）
+// 拉起竖滑时后台预热起点+后几条，尽量让原生首次 activate 即命中。
+window.__hgFeedCoverCache = window.__hgFeedCoverCache || {};    // id → dataStr
+window.__hgFeedCoverReadySet = window.__hgFeedCoverReadySet || {}; // id → 是否已解过
+
+// 从 feedContext 取某 id 的封面 url（找不到返回 ''）。
+function feedCoverUrlOf(id) {
+  const list = state.feedContext && Array.isArray(state.feedContext.items) ? state.feedContext.items : [];
+  const item = list.find(entry => String(entry.id) === String(id));
+  return item ? String(item.cover || '') : '';
+}
+
+// 后台解一条封面写缓存。返回 Promise（调用方可不 await）。
+function warmFeedCover(id) {
+  const key = String(id);
+  if (window.__hgFeedCoverReadySet[key]) return Promise.resolve(window.__hgFeedCoverCache[key] || '');
+  const url = feedCoverUrlOf(key);
+  if (!url) { window.__hgFeedCoverReadySet[key] = true; window.__hgFeedCoverCache[key] = ''; return Promise.resolve(''); }
+  // 复用 cover.js 的解密实例：内部 api('cover',{url}) → Java 解密 → data:；带去重与重试。
+  const p = (typeof cover !== 'undefined' && cover && typeof cover.get === 'function')
+    ? cover.get(url)
+    : api('cover', { url });
+  return p.then(data => {
+    const text = String(data || '');
+    // 只认 data: 开头的（Java 解密成功产物）；兜底原址 http(s) 原生解不了，当未就绪存 ''。
+    const ok = /^data:image\//i.test(text) ? text : '';
+    window.__hgFeedCoverCache[key] = ok;
+    window.__hgFeedCoverReadySet[key] = true;
+    return ok;
+  }).catch(() => {
+    window.__hgFeedCoverCache[key] = '';
+    window.__hgFeedCoverReadySet[key] = true;   // 失败也算解过一次，别每次 activate 都重解
+    return '';
+  });
+}
+
+// 预热：起点及后若干条的封面（与 __hgFeedWarmBookmarks 同一起点节奏）。
+window.__hgFeedWarmCovers = function (items, startIndex) {
+  const list = asArray(items);
+  const start = Math.max(0, Number(startIndex) || 0);
+  const end = Math.min(list.length, start + 6);
+  for (let i = start; i < end; i += 1) {
+    if (list[i] && list[i].id != null) warmFeedCover(list[i].id);
+  }
+};
+
+// 原生进入某条时同步取封面 data；未就绪返回 '' 并后台补解（下次复读命中）。
+window.__hgFeedCoverData = function (id) {
+  const key = String(id);
+  if (window.__hgFeedCoverReadySet[key]) return String(window.__hgFeedCoverCache[key] || '');
+  warmFeedCover(key);                                  // 补解，不阻塞本次同步返回
+  return String(window.__hgFeedCoverCache[key] || ''); // 未就绪 → ''
+};
+
+// 该 id 封面缓存是否已就绪：'true'/'false' 字符串（原生据此决定是否 300ms 复读）。
+window.__hgFeedCoverReady = function (id) {
+  return Boolean(window.__hgFeedCoverReadySet[String(id)]);
+};
+
 // H-4 进详情：原生调 hgFeedOpenDetail(id)。前端进详情，并记下来源上下文以便返回续刷。
 window.hgFeedOpenDetail = (id) => {
   const context = state.feedContext;
-  // 记住当前这次竖滑的来源与「滑到第几条」，详情返回时前端重建的兜底就靠它。
-  if (context) {
-    let index = 0;
+  // 把起点 index 对齐到被点开的那条（原生可能滑到了别的条才点头像），
+  // rememberFeedReturnContext 读的是 state.feedIndex，返回续刷就回到这一条。
+  if (context && Array.isArray(context.items)) {
     const at = context.items.findIndex(entry => String(entry.id) === String(id));
-    if (at >= 0) index = at;
-    state.feedReturnContext = { context, index };
+    if (at >= 0) state.feedIndex = at;
   }
+  // 落盘记「从竖滑进的详情」：app-route.js 的 rememberFeedReturnContext 会写
+  // state.feedReturnContext（完整快照）到 localStorage，抗 Activity/进程回收。
+  // 返回时 hgBack 的 detail 分支调 takeFeedReturnContext() 取回并续刷。
+  if (typeof rememberFeedReturnContext === 'function') rememberFeedReturnContext(id);
   // 进详情会离开竖滑（原生保活或退出），先把 feed 态收干净再进详情。
   feedPlayer.cleanup();
   goDetail(id);
@@ -3000,6 +3193,7 @@ document.addEventListener('click', async event => {
     else if (key === 'decode') savePlayerPrefs({ decode: value });
     else if (key === 'cache') savePlayerPrefs({ cache: Number(value) });
     else if (key === 'autoFallback') savePlayerPrefs({ autoFallback: value === 'on' });
+    else if (key === 'feedMode') setFeedModeEnabled(value === '1');
     renderPlayerSettings();
     return;
   }

@@ -53,6 +53,10 @@ final class VlcControlsView {
         int durationMs();
         /** 用户点了锁。锁的状态归宿主，这里只管画。 */
         void onLockToggle();
+        /** 右侧「进主页/合集」被点（刷视频形态下由宿主反射调 hgFeedOpenDetail）。 */
+        void onOpenDetail();
+        /** 右侧「收藏★」被点（宿主反射调 hgFeedToggleBookmark 并回填状态）。 */
+        void onToggleBookmark();
     }
 
     private final Activity activity;
@@ -63,7 +67,10 @@ final class VlcControlsView {
     TextView titleView, metaView, clockView, hintView, errorView;
     IconButton playButton;
     IconButton lockButton;
-    /** 锁定态常驻的小角标。只有一枚小锁在屏上时，用户过一会儿就忘了自己锁着。 */
+    /**
+     * 锁定态「轻触屏幕」浮现的小提示（「双击解锁」）。不是常驻角标 ——
+     * 只在锁定态轻触时浮现约 2 秒后自动淡出，屏幕平时保持干净（对齐抖音/B站）。
+     */
     TextView lockChip;
     private long lastLockTap;
     /**
@@ -76,8 +83,24 @@ final class VlcControlsView {
     LinearLayout speedPanel;
     ProgressBar spinner;
 
+    // ── 右侧竖排入口（刷视频用）：圆形封面头像进详情 + 收藏★ ──────────
+    LinearLayout rightRail;
+    CoverAvatarView railDetailButton;
+    IconButton railBookmarkButton;
+
     private final Runnable hideHint = new Runnable() {
         @Override public void run() { if (hintView != null) hintView.setVisibility(View.GONE); }
+    };
+
+    /**
+     * 锁定态浮现的小锁 + 提示自动淡出。和 {@link #hintHandler} 共用同一个 Handler
+     * 实例（removeCallbacks 才能删掉上一条）。
+     */
+    private final Runnable hideLockPrompt = new Runnable() {
+        @Override public void run() {
+            if (lockButton != null && locked) fadeOut(lockButton);
+            if (lockChip != null) fadeOut(lockChip);
+        }
     };
 
     /**
@@ -149,6 +172,7 @@ final class VlcControlsView {
         buildBottomBar(root);
         buildSpeedPanel(root);
         buildLockButton(root);
+        buildRightRail(root);
 
         if (interactive && touch != null) root.setOnTouchListener(touch);
         setVisible(true);
@@ -295,18 +319,20 @@ final class VlcControlsView {
                     return;
                 }
                 lastLockTap = now;
-                showHint("已锁定 · 再点一次解锁");
-                hideHintAfter(1400);
+                // 再提示一次并续命 2 秒，让用户看清「要双击」。
+                flashLockPrompt();
             }
         });
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(44), dp(44),
                 Gravity.START | Gravity.CENTER_VERTICAL);
         params.setMargins(dp(10), 0, 0, 0);
         root.addView(lockButton, params);
+        // 未锁定时由 setVisible 跟随控制栏显隐 —— 先按不可见起步。
         lockButton.setVisibility(View.INVISIBLE);
 
+        // 锁定态轻触时浮现的小提示（非常驻）。文案随浮现场景变化。
         lockChip = new TextView(activity);
-        lockChip.setText("已锁定");
+        lockChip.setText("双击解锁");
         lockChip.setTextColor(0xE6FFFFFF);
         lockChip.setTextSize(11f);
         lockChip.setGravity(Gravity.CENTER);
@@ -318,6 +344,203 @@ final class VlcControlsView {
         chipParams.setMargins(dp(14), 0, 0, dp(58));
         root.addView(lockChip, chipParams);
         lockChip.setVisibility(View.GONE);
+    }
+
+    /**
+     * 锁定态轻触屏幕：浮现小锁 + 「双击解锁」小提示，约 2 秒后自动淡出。
+     *
+     * <p>这是锁定态下唯一可见的控件（平时锁图标也藏着，屏幕干净）。双击锁 → 解锁；
+     * 轻触只「唤醒」它，不会直接解开（防误触）。用 {@link #hintHandler} 定时淡出。
+     */
+    void flashLockPrompt() {
+        if (!locked || lockButton == null) return;
+        lockButton.setVisibility(View.VISIBLE);
+        lockButton.setAlpha(1f);
+        if (lockChip != null) {
+            lockChip.setText("双击解锁");
+            lockChip.setVisibility(View.VISIBLE);
+            lockChip.setAlpha(1f);
+        }
+        hintHandler.removeCallbacks(hideLockPrompt);
+        hintHandler.postDelayed(hideLockPrompt, 2000);
+    }
+
+    /** 淡出后置 GONE（保留 alpha 动画，避免生硬消失）。 */
+    private void fadeOut(View view) {
+        if (view == null) return;
+        view.animate().alpha(0f).setDuration(180).withEndAction(new Runnable() {
+            @Override public void run() { view.setVisibility(View.GONE); }
+        }).start();
+    }
+
+    // ── 右侧竖排入口（刷视频）────────────────────────────────────────
+    //
+    // 两个：头像（进主页/合集=进详情）+ 收藏★。竖排靠右、垂直居中偏上，
+    // 不挡画面中心。默认隐藏，由宿主（FEED_LIST 形态）调 showRightRail(true) 打开。
+    private void buildRightRail(FrameLayout root) {
+        rightRail = new LinearLayout(activity);
+        rightRail.setOrientation(LinearLayout.VERTICAL);
+        rightRail.setGravity(Gravity.CENTER_HORIZONTAL);
+        rightRail.setVisibility(View.GONE);
+
+        railDetailButton = new CoverAvatarView(activity);
+        railDetailButton.setContentDescription("进主页/合集");
+        railDetailButton.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { host.onOpenDetail(); }
+        });
+        LinearLayout.LayoutParams p1 = new LinearLayout.LayoutParams(dp(46), dp(46));
+        p1.bottomMargin = dp(20);
+        rightRail.addView(railDetailButton, p1);
+
+        railBookmarkButton = new IconButton(activity);
+        railBookmarkButton.setIcon(IconButton.STAR);
+        railBookmarkButton.setContentDescription("收藏");
+        railBookmarkButton.setBackground(rounded(0x40000000, 22));
+        railBookmarkButton.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { host.onToggleBookmark(); }
+        });
+        rightRail.addView(railBookmarkButton, new LinearLayout.LayoutParams(dp(46), dp(46)));
+
+        // 靠右、垂直居中偏上一点（大约屏高 45% 处起排）。
+        FrameLayout.LayoutParams railParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.END | Gravity.CENTER_VERTICAL);
+        railParams.setMargins(0, 0, dp(12), 0);
+        root.addView(rightRail, railParams);
+        // 显式提到最前 + 抬 elevation：确保浮在 pager 之上、点击不被下面的 RecyclerView 抢走。
+        rightRail.bringToFront();
+        railDetailButton.setClickable(true);
+        railBookmarkButton.setClickable(true);
+    }
+
+    /** 宿主：刷视频形态下才显右侧竖排；退出刷视频/单集隐藏。 */
+    void showRightRail(boolean visible) {
+        if (rightRail != null) rightRail.setVisibility(visible ? View.VISIBLE : View.GONE);
+    }
+
+    /** 收藏星标亮/灭。 */
+    void setBookmarked(boolean on) {
+        if (railBookmarkButton != null) railBookmarkButton.setFilled(on);
+    }
+
+    /** 设置圆形封面头像的图；null = 纯色圆兜底（无封面/未就绪/解密失败）。 */
+    void setRailCover(android.graphics.Bitmap bmp) {
+        if (railDetailButton != null) railDetailButton.setCover(bmp);
+    }
+
+    /**
+     * 抖音式圆形封面头像：圆形裁切显示封面 Bitmap，右下角叠红底白「+」小角标（纯装饰，
+     * 不单独响应点击 —— 点整个圈都是进详情）。无图时画纯色圆兜底，不崩。
+     */
+    static final class CoverAvatarView extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ringPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path clipPath = new Path();
+        private final RectF oval = new RectF();
+        private android.graphics.Bitmap cover;
+
+        CoverAvatarView(Context context) {
+            super(context);
+            // 半透明黑底（沿用原 railDetailButton 的 0x40000000）—— 无图时就是纯色圆。
+            ringPaint.setStyle(Paint.Style.STROKE);
+            ringPaint.setStrokeWidth(context.getResources().getDisplayMetrics().density * 1.5f);
+            ringPaint.setColor(0x66FFFFFF);   // 细白描边，抖音观感
+            setLayerType(View.LAYER_TYPE_SOFTWARE, null);   // clip 圆路径在软件层最稳
+        }
+
+        void setCover(android.graphics.Bitmap bmp) {
+            this.cover = bmp;
+            invalidate();
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            int w = getWidth(), h = getHeight();
+            if (w <= 0 || h <= 0) return;
+            float pad = getResources().getDisplayMetrics().density * 1f;
+            oval.set(pad, pad, w - pad, h - pad);
+            float r = Math.min(oval.width(), oval.height()) / 2f;
+            float cx = w / 2f, cy = h / 2f;
+
+            // 底圆（无图时的纯色兜底，也是头像圆底）。
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(0x40000000);
+            canvas.drawCircle(cx, cy, r, paint);
+
+            if (cover != null && !cover.isRecycled()) {
+                // 圆形裁切：save → clipPath(圆) → 画居中裁切的 bitmap（cover 效果）→ restore。
+                canvas.save();
+                clipPath.reset();
+                clipPath.addCircle(cx, cy, r, Path.Direction.CW);
+                canvas.clipPath(clipPath);
+                // 居中裁切成正方形再铺满圆（避免拉伸变形）。
+                float side = Math.min(cover.getWidth(), cover.getHeight());
+                float sx = (cover.getWidth() - side) / 2f;
+                float sy = (cover.getHeight() - side) / 2f;
+                android.graphics.Rect src = new android.graphics.Rect(
+                        (int) sx, (int) sy, (int) (sx + side), (int) (sy + side));
+                android.graphics.RectF dst = new android.graphics.RectF(cx - r, cy - r, cx + r, cy + r);
+                canvas.drawBitmap(cover, src, dst, paint);
+                canvas.restore();
+            }
+
+            // 细白环。
+            canvas.drawCircle(cx, cy, r, ringPaint);
+
+            // 右下角红底白「+」小角标（装饰）。角标直径约半径的 55%，压在下边缘。
+            float badgeR = r * 0.30f;
+            float bx = cx + r * 0.66f;
+            float by = cy + r * 0.66f;
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(0xFFFF2A4D);   // 抖音红
+            canvas.drawCircle(bx, by, badgeR, paint);
+            // 白色「+」
+            paint.setColor(0xFFFFFFFF);
+            paint.setStrokeWidth(Math.max(1.5f, badgeR * 0.28f));
+            paint.setStyle(Paint.Style.STROKE);
+            canvas.drawLine(bx - badgeR * 0.5f, by, bx + badgeR * 0.5f, by, paint);
+            canvas.drawLine(bx, by - badgeR * 0.5f, bx, by + badgeR * 0.5f, paint);
+            paint.setStyle(Paint.Style.FILL);
+        }
+    }
+
+    /**
+     * 屏幕坐标 (rawX,rawY) 是否落在某个「当前可见、可点击」的 overlay 按钮上。
+     *
+     * <p>用途：Activity 的 onRootTouch 挂在 root（父 FrameLayout）上，父容器的 OnTouchListener
+     * 在 dispatchTouchEvent 阶段先于子 View 收到 DOWN；对 DOWN 返回 true 就消费掉整条事件，
+     * 子按钮永远点不到。所以 DOWN 时必须先判「这点是不是按在按钮上」——是就 return false
+     * 放行给子 View。
+     *
+     * <p>坐标口径统一用**屏幕坐标**：event 用 getRawX/getRawY，按钮用 getGlobalVisibleRect
+     * （同为屏幕坐标），绝不混用 getX/getY（root 内坐标）。
+     *
+     * @return true = 命中某 overlay 按钮（调用方应 return false 不消费）
+     */
+    boolean hitOverlayButton(int rawX, int rawY) {
+        // 右侧竖排（刷视频）：进详情 + 收藏，任一可见按钮命中都算。
+        if (rightRail != null && rightRail.getVisibility() == View.VISIBLE) {
+            if (hitView(railDetailButton, rawX, rawY)) return true;
+            if (hitView(railBookmarkButton, rawX, rawY)) return true;
+        }
+        // 左上锁按钮（未锁时随控制栏显隐；锁定时仅在 flashLockPrompt 浮现期间可见）——
+        // 只要当前可见且命中，就放行给子 View，让锁按钮自己处理单击/双击解锁。
+        if (lockButton != null && lockButton.getVisibility() == View.VISIBLE) {
+            if (hitView(lockButton, rawX, rawY)) return true;
+        }
+        return false;
+    }
+
+    /** 单个 view 的屏幕矩形是否含点（view 必须 VISIBLE 且有面积）。 */
+    private boolean hitView(View view, int rawX, int rawY) {
+        if (view == null || view.getVisibility() != View.VISIBLE) return false;
+        android.graphics.Rect r = new android.graphics.Rect();
+        if (!view.getGlobalVisibleRect(r)) return false;
+        return hitRect(r.left, r.top, r.right, r.bottom, rawX, rawY);
+    }
+
+    /** 纯函数：点是否在矩形内（含边界）。屏幕坐标。单测直接钉。 */
+    static boolean hitRect(int left, int top, int right, int bottom, int x, int y) {
+        return x >= left && x < right && y >= top && y < bottom;
     }
 
     /**
@@ -333,15 +556,21 @@ final class VlcControlsView {
         lockButton.setIcon(value ? IconButton.LOCK : IconButton.UNLOCK);
         lockButton.setContentDescription(value ? "解锁屏幕" : "锁定屏幕");
         if (value) {
+            // 锁上：控件全藏，锁图标也淡出 —— 屏幕干净只剩视频。
+            // 之后要动锁，靠「轻触屏幕浮现小锁（flashLockPrompt）→ 双击解锁」。
             animateBar(topBar, false);
             animateBar(bottomBar, false);
             if (topScrim != null) topScrim.animate().alpha(0f).setDuration(180).start();
             if (bottomScrim != null) bottomScrim.animate().alpha(0f).setDuration(180).start();
             hideSpeedPanel();
-            lockButton.setVisibility(View.VISIBLE);
-            if (lockChip != null) lockChip.setVisibility(View.VISIBLE);
+            hintHandler.removeCallbacks(hideLockPrompt);
+            fadeOut(lockButton);
+            if (lockChip != null) fadeOut(lockChip);
+            if (rightRail != null) rightRail.setVisibility(View.GONE);
         } else {
-            if (lockChip != null) lockChip.setVisibility(View.GONE);
+            // 解锁：把控制栏叫回来（宿主自动隐藏计时会接着收它），锁按钮归位为普通控件。
+            hintHandler.removeCallbacks(hideLockPrompt);
+            if (lockChip != null) { lockChip.setAlpha(1f); lockChip.setVisibility(View.GONE); }
             setVisible(true);
         }
     }
@@ -412,17 +641,23 @@ final class VlcControlsView {
 
     void setVisible(boolean visible) {
         if (locked) {
-            // 锁着：任何「显示控制栏」的调用都不算数，屏幕上只留那个锁。
+            // 锁着：任何「显示控制栏」的调用都不算数，屏幕保持干净（锁也藏着）。
+            // 要动锁只能靠 flashLockPrompt()（轻触浮现）。
             animateBar(topBar, false);
             animateBar(bottomBar, false);
             if (topScrim != null) topScrim.animate().alpha(0f).setDuration(180).start();
             if (bottomScrim != null) bottomScrim.animate().alpha(0f).setDuration(180).start();
             hideSpeedPanel();
-            if (lockButton != null) lockButton.setVisibility(View.VISIBLE);
-            if (lockChip != null) lockChip.setVisibility(View.VISIBLE);
+            if (lockChip != null && lockChip.getVisibility() != View.VISIBLE) {
+                lockButton.setVisibility(View.GONE);
+            }
             return;
         }
-        if (lockButton != null) lockButton.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
+        // 未锁定：锁按钮只是普通控件，跟着控制栏一起显/隐。
+        if (lockButton != null) {
+            lockButton.setAlpha(1f);
+            lockButton.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
+        }
         animateBar(topBar, visible);
         animateBar(bottomBar, visible);
         // 渐变跟着走：它是给控件垫底的，控件收了它还挂着就是两道死黑带。
@@ -651,14 +886,19 @@ final class VlcControlsView {
      * 播放控制键：图标用 Canvas 画，不走字符 —— ⏪⏸ 那类字符在小米上是彩色 emoji。
      */
     static class IconButton extends View {
-        static final int PAUSE = 0, PLAY = 1, REW = 2, FWD = 3, LOCK = 4, UNLOCK = 5;
+        static final int PAUSE = 0, PLAY = 1, REW = 2, FWD = 3, LOCK = 4, UNLOCK = 5, PERSON = 6, STAR = 7;
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private int icon = PLAY;
+        /** STAR 用：true=已收藏（实心亮），false=未收藏（空心）。 */
+        private boolean filled;
 
         IconButton(Context context) { super(context); }
         IconButton(Context context, AttributeSet attrs) { super(context, attrs); }
 
         void setIcon(int which) { icon = which; invalidate(); }
+
+        /** 收藏星标：切实心/空心。 */
+        void setFilled(boolean value) { filled = value; invalidate(); }
 
         @Override protected void onDraw(Canvas canvas) {
             float cx = getWidth() / 2f, cy = getHeight() / 2f;
@@ -695,6 +935,17 @@ final class VlcControlsView {
                     canvas.drawLine(cx - u * 0.35f, cy - u * 1.3f, cx - u * 0.35f, cy, paint);
                 }
                 paint.setStyle(Paint.Style.FILL);
+            } else if (icon == PERSON) {
+                // 头像式「进主页/合集」：一个圆头 + 半圆肩。
+                canvas.drawCircle(cx, cy - u * 1.1f, u * 1.3f, paint);
+                Path shoulders = new Path();
+                shoulders.addArc(new RectF(cx - u * 2.4f, cy + u * 0.1f, cx + u * 2.4f, cy + u * 4.9f),
+                        180f, 180f);
+                shoulders.close();
+                canvas.drawPath(shoulders, paint);
+            } else if (icon == STAR) {
+                // 收藏星标：五角星。filled=实心（已收藏），否则描边（未收藏）。
+                drawStar(canvas, cx, cy, u * 2.6f, u * 1.1f, filled);
             } else {
                 boolean fwd = icon == FWD;
                 for (int i = 0; i < 2; i++) {
@@ -712,6 +963,32 @@ final class VlcControlsView {
                     path.close();
                     canvas.drawPath(path, paint);
                 }
+            }
+        }
+
+        /** 画五角星。filled=实心（金色），否则描边（白色细线）。 */
+        private void drawStar(Canvas canvas, float cx, float cy, float outer, float inner, boolean filled) {
+            Path star = new Path();
+            double start = -Math.PI / 2;   // 顶点朝上
+            for (int i = 0; i < 10; i++) {
+                double r = (i % 2 == 0) ? outer : inner;
+                double a = start + i * Math.PI / 5;
+                float x = (float) (cx + Math.cos(a) * r);
+                float y = (float) (cy + Math.sin(a) * r);
+                if (i == 0) star.moveTo(x, y); else star.lineTo(x, y);
+            }
+            star.close();
+            if (filled) {
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(0xFFFFC107);   // 金色
+                canvas.drawPath(star, paint);
+                paint.setColor(0xFFFFFFFF);   // 复原，别污染后续绘制
+            } else {
+                paint.setStyle(Paint.Style.STROKE);
+                paint.setStrokeWidth(Math.max(1f, outer * 0.09f));
+                paint.setColor(0xFFFFFFFF);
+                canvas.drawPath(star, paint);
+                paint.setStyle(Paint.Style.FILL);
             }
         }
     }
