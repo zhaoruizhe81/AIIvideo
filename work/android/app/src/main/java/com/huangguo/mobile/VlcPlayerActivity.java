@@ -154,8 +154,40 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
     // 轮转（A/B 各认一页），地址按需经 MainActivity 的 WebView 向页面要 ——
     // 解密、wasm、多线路那套逻辑全在页面里，原生不重复实现。
     private boolean feedMode;
+    /**
+     * 刷视频模式（跨视频竖滑，FEED_LIST）。
+     *
+     * <p>{@link #feedMode} 语义保留「用 pager（SERIES 或 FEED_LIST 都为 true）」，
+     * 现有所有 {@code if (feedMode)} 的 pager 逻辑不动；本字段只用来区分
+     * 「pager 里一页是一部剧的一集（SERIES）」还是「一条独立视频（FEED_LIST）」，
+     * 只在「集号语义」处加分支。
+     */
+    private boolean feedListMode;
     private int[] eps = new int[0];
     private int curPos;
+
+    // ── FEED_LIST（刷视频：跨视频条目数组）──────────────────────────
+    //
+    // 与 SERIES 的区别：一页 = 一个视频条目（{@link FeedItem}），每条只播**第 1 集**，
+    // 上下滑切到下一/上一条目，不在剧内滑集。地址按需回调 __hgNativeEpisode(id,1)。
+    private final java.util.List<FeedItem> feedList = new java.util.ArrayList<FeedItem>();
+    /** 列表身份（前端生成）。续页回包时校验：listToken 变了就丢弃，防串台。 */
+    private String listToken = "";
+    /** 这份列表还能不能续页（前端 hasMore）。 */
+    private boolean hasMore;
+    /** 续页请求在飞：去重，避免同一次滑到底重复问前端。 */
+    private boolean feedMorePending;
+
+    /** FEED_LIST 一页的最小描述。包内可见（字段 package-private）以便单测直接构造。 */
+    static final class FeedItem {
+        final String id;
+        final String title;
+        final String cover;
+        final String source;
+        FeedItem(String id, String title, String cover, String source) {
+            this.id = id; this.title = title; this.cover = cover; this.source = source;
+        }
+    }
     private RecyclerView pager;
     private LinearLayoutManager pagerLayout;
     private FeedAdapter feedAdapter;
@@ -365,17 +397,136 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         startPlayback();
     }
 
-    /** 按 payload 算播放形态：eps 至少两集才走 mini-feed 翻页器，单集走老路。 */
+    /** 按 payload 算播放形态：feedList 非空→FEED_LIST；eps 至少两集→SERIES；否则单集。 */
     private void readPayloadShape() {
-        org.json.JSONArray epsRaw = payload.optJSONArray("eps");
-        if (epsRaw != null && epsRaw.length() > 1) {
+        feedList.clear();
+        feedListMode = false;
+        feedMode = false;
+        feedMorePending = false;
+        listToken = "";
+        hasMore = false;
+        int shape = classifyShape(payload);
+        if (shape == SHAPE_FEED_LIST) {
+            org.json.JSONArray listRaw = payload.optJSONArray("feedList");
+            for (int i = 0; i < listRaw.length(); i++) {
+                org.json.JSONObject one = listRaw.optJSONObject(i);
+                if (one == null) continue;
+                String id = one.optString("id", "").trim();
+                if (id.length() == 0) continue;   // 没有 id 的条目播不了，直接不当一页
+                feedList.add(new FeedItem(id,
+                        one.optString("title", ""), one.optString("cover", ""), one.optString("source", "")));
+            }
+            listToken = payload.optString("listToken", "");
+            hasMore = payload.optBoolean("hasMore", false);
+            feedMorePending = false;
+            // 数组被过滤（空 id）后可能为空：退回单集，别起一个没有内容的翻页器。
+            if (feedList.isEmpty()) {
+                feedMode = false;
+                return;
+            }
+            feedListMode = true;
+            feedMode = true;
+            curPos = clampIndex(payload.optInt("index", 0), feedList.size());
+            return;
+        }
+        if (shape == SHAPE_SERIES) {
+            org.json.JSONArray epsRaw = payload.optJSONArray("eps");
             feedMode = true;
             eps = new int[epsRaw.length()];
             for (int i = 0; i < epsRaw.length(); i++) eps[i] = epsRaw.optInt(i, i + 1);
-            curPos = Math.max(0, Math.min(eps.length - 1, payload.optInt("index", 0)));
+            curPos = clampIndex(payload.optInt("index", 0), eps.length);
         } else {
             feedMode = false;
         }
+    }
+
+    // ── 形态判定与页访问器（纯函数，供单测钉住）──────────────────────
+    static final int SHAPE_SINGLE = 0;
+    static final int SHAPE_SERIES = 1;
+    static final int SHAPE_FEED_LIST = 2;
+
+    /**
+     * 三形态判定（互斥）：feedList 非空 → FEED_LIST；否则 eps.length&gt;1 → SERIES；否则 SINGLE。
+     *
+     * <p>纯函数：只看 payload 里 feedList / eps 的形状，不碰任何状态，单测直接钉。
+     */
+    static int classifyShape(org.json.JSONObject payload) {
+        if (payload == null) return SHAPE_SINGLE;
+        org.json.JSONArray list = payload.optJSONArray("feedList");
+        if (list != null) {
+            // 至少要有一个带 id 的条目才算 FEED_LIST —— 全是脏数据的数组当没有。
+            for (int i = 0; i < list.length(); i++) {
+                org.json.JSONObject one = list.optJSONObject(i);
+                if (one != null && one.optString("id", "").trim().length() > 0) return SHAPE_FEED_LIST;
+            }
+        }
+        org.json.JSONArray epsRaw = payload.optJSONArray("eps");
+        if (epsRaw != null && epsRaw.length() > 1) return SHAPE_SERIES;
+        return SHAPE_SINGLE;
+    }
+
+    /** index 越界钳制到 [0, count-1]；count&lt;=0 返回 0。纯函数。 */
+    static int clampIndex(int index, int count) {
+        if (count <= 0) return 0;
+        if (index < 0) return 0;
+        if (index >= count) return count - 1;
+        return index;
+    }
+
+    // ── 页访问器：把「一页是什么」从 eps[]/payload 里收敛出来 ─────────
+    //
+    // SERIES：一页 = 一部剧的一集（videoId 恒为 payload.id，episode 取 eps[pos]）。
+    // FEED_LIST：一页 = 一条独立视频（videoId 取 feedList[pos].id，episode 恒为 1）。
+    // 其余读取点（activate/preload/prewarm/altsOf/updateEpisodeUi/persistFeedProgress）
+    // 一律走这里，别再各自写 eps[curPos] / payload.id。
+
+    /** 总页数。 */
+    private int pageCount() {
+        return feedListMode ? feedList.size() : eps.length;
+    }
+
+    /** 这一页对应的视频 id。 */
+    private String pageVideoId(int pos) {
+        if (feedListMode) {
+            return (pos >= 0 && pos < feedList.size()) ? feedList.get(pos).id : "";
+        }
+        return payload.optString("id", "");
+    }
+
+    /** 这一页播放的集号。FEED_LIST 恒为第 1 集。 */
+    private int pageEpisode(int pos) {
+        if (feedListMode) return 1;
+        return (pos >= 0 && pos < eps.length) ? eps[pos] : 1;
+    }
+
+    /** 这一页标题。 */
+    private String pageTitle(int pos) {
+        if (feedListMode) {
+            return (pos >= 0 && pos < feedList.size()) ? feedList.get(pos).title : "";
+        }
+        return payload.optString("title", "");
+    }
+
+    /** 这一页封面。 */
+    private String pageCover(int pos) {
+        if (feedListMode) {
+            return (pos >= 0 && pos < feedList.size()) ? feedList.get(pos).cover : "";
+        }
+        return payload.optString("cover", "");
+    }
+
+    /** 这一页的源身份（观影历史按源隔离）。 */
+    private String pageSource(int pos) {
+        if (feedListMode) {
+            return (pos >= 0 && pos < feedList.size()) ? feedList.get(pos).source : "";
+        }
+        return payload.optString("source", "");
+    }
+
+    /** 日志用的一页标签：FEED_LIST「视频 id=…」，SERIES「第N集」。 */
+    private String pageLabel(int pos) {
+        if (feedListMode) return "视频 id=" + pageVideoId(pos);
+        return "第 " + pageEpisode(pos) + " 集";
     }
 
     /** 单集模式的 surface 回调：把 SurfaceView 的像素尺寸记下来交给 applyWindowSize。 */
@@ -400,7 +551,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         playErrorReported = false;
         JSONObject opening = new JSONObject();
         try {
-            opening.put("mode", feedMode ? "feed" : "single");
+            opening.put("mode", progressMode(feedMode, feedListMode));
             // 从 payload 读而不是读 hwDecode：hwDecode 要等 startVlc 才定下来，
             // 而 play_start 必须比任何一个失败分支都早 —— 否则「连 startVlc 都没
             // 走到」这种失败就没有 play_start 跟它配对了。
@@ -663,7 +814,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                 closed.put("finished", ended || sawEnd);
                 closed.put("err", errorShown);
                 closed.put("frame", firstFrameReported);
-                closed.put("mode", feedMode ? "feed" : "single");
+                closed.put("mode", progressMode(feedMode, feedListMode));
             } catch (Throwable ignored) {}
             reportPlay("play_end", closed);
         }
@@ -1238,7 +1389,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             props.put("stage", stage);
             if (code != null && code.length() > 0) props.put("code", code);
             props.put("msg", text == null ? "" : text);
-            props.put("mode", feedMode ? "feed" : "single");
+            props.put("mode", progressMode(feedMode, feedListMode));
             props.put("ms", (int) Math.min(Math.max(0, System.currentTimeMillis() - playStartedAt), 600000L));
             // 上游状态码：它把「源站这一集的地址没了」和「播放器解不了」分成两件事。
             // playbackFailureText() 一直在用这个值说话，但从来没有作为数据留下过。
@@ -1258,7 +1409,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             props.put("ms", (int) Math.min(Math.max(0, now - playStartedAt), 600000L));
             if (tPlay > 0) props.put("submit", (int) Math.min(Math.max(0, now - tPlay), 600000L));
             props.put("hw", hwDecode);
-            props.put("mode", feedMode ? "feed" : "single");
+            props.put("mode", progressMode(feedMode, feedListMode));
         } catch (Throwable ignored) {}
         reportPlay("play_first_frame", props);
     }
@@ -1604,7 +1755,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
     }
 
     private void activate(int pos) {
-        if (pos < 0 || pos >= eps.length) return;
+        if (pos < 0 || pos >= pageCount()) return;
         // startPlayback 会调一次，RecyclerView 首次布局的 scroll-idle 还会调一次。
         // 不去重的话第二次会对正在播的 player 再 setMedia 一遍 —— VLC 当场把
         // 输入流取消掉（日志是 Cancellation + Failed to create demuxer），黑屏。
@@ -1621,6 +1772,8 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         silenceOthers(pos);
         // 滑回一集失败过的页面时要重新给机会：上一次可能只是那会儿网络抖了。
         session.clearFailed(pos);
+        // 滑到末条附近还有下一页就向前端要（去重 + listToken 校验在 requestMoreFeed 里）。
+        maybeRequestMoreFeed(pos);
         // 页面起播时给的地址（index 那一集）直接吃掉——它刚刚就在网页播放器里放着
         if (pos == payload.optInt("index", -1) && !session.hasUrl(pos)) {
             String seed = payload.optString("url", "");
@@ -1641,19 +1794,26 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         if (pv != null) { pv.spin.setVisibility(View.VISIBLE); pv.error.setVisibility(View.GONE); }
         final int target = pos;
         if (!session.beginResolve(pos)) return;   // 已经有人在取了
+        final String videoId = pageVideoId(target);
+        final int episode = pageEpisode(target);
         new Thread(new Runnable() {
             @Override public void run() {
-                final String url = resolveViaJs(eps[target]);
+                final String url = resolveViaJs(videoId, episode);
                 ui.post(new Runnable() {
                     @Override public void run() {
                         session.endResolve(target);
                         if (url == null || url.length() == 0) {
                             session.markFailed(target);
+                            // FEED_LIST：取不到地址（含非 http(s)）的条目一律跳过，别卡死。
+                            if (feedListMode) {
+                                skipDeadFeedItem(target);
+                                return;
+                            }
                             PageView pv = feedAdapter.pageAt(target);
                             if (pv != null) {
                                 pv.spin.setVisibility(View.GONE);
                                 pv.error.setVisibility(View.VISIBLE);
-                                pv.error.setText("第 " + eps[target] + " 集取不到播放地址，滑到别的集再回来试试");
+                                pv.error.setText("第 " + pageEpisode(target) + " 集取不到播放地址，滑到别的集再回来试试");
                             }
                             return;
                         }
@@ -1669,6 +1829,32 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                 });
             }
         }).start();
+    }
+
+    /**
+     * FEED_LIST：某条取不到地址就跳过它，自动落到下一条。
+     *
+     * <p>取不到（空/非 http(s)）说明这条源这边播不了（图文、合集、被判死的线路），
+     * 抖音式体验里不该卡在这一条上白转圈。跳过策略：优先往下滑到下一条；已是最后
+     * 一条则往上退一条；两侧都没了（全列表都死了）就停在这一页显示一句提示。
+     */
+    private void skipDeadFeedItem(int pos) {
+        PageView pv = feedAdapter == null ? null : feedAdapter.pageAt(pos);
+        if (pv != null) { pv.spin.setVisibility(View.GONE); pv.error.setVisibility(View.GONE); }
+        int next = pos + 1;
+        if (next < pageCount()) {
+            if (pager != null) pager.smoothScrollToPosition(next);
+            return;
+        }
+        int prev = pos - 1;
+        if (prev >= 0) {
+            if (pager != null) pager.smoothScrollToPosition(prev);
+            return;
+        }
+        if (pv != null) {
+            pv.error.setVisibility(View.VISIBLE);
+            pv.error.setText("这一条播不了，滑到别的视频试试");
+        }
     }
 
     /**
@@ -1693,7 +1879,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
     private void prewarmNeighborNow(int pos) {
         if (!feedMode) return;
         final int target = pos + warmDirection;
-        if (target < 0 || target >= eps.length) return;
+        if (target < 0 || target >= pageCount()) return;
         // 已经暖着/正在暖的同一页不重复折腾。
         if (target == warmingPos) return;
         String url = session.urlOf(target);
@@ -1750,7 +1936,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                 if (warmingPos == pending) warmingPos = -1;
             }
         }, 6000);
-        android.util.Log.d("HG.Vlc", "预热第 " + eps[target] + " 集（方向 " + warmDirection + "）");
+        android.util.Log.d("HG.Vlc", "预热" + pageLabel(target) + "（方向 " + warmDirection + "）");
     }
 
     /**
@@ -1775,7 +1961,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         warmUrl = url == null ? "" : url;
         PageView pv = feedAdapter == null ? null : feedAdapter.pageAt(pos);
         if (pv != null) pv.spin.setVisibility(View.GONE);
-        android.util.Log.d("HG.Vlc", "预热就绪：第 " + eps[pos] + " 集");
+        android.util.Log.d("HG.Vlc", "预热就绪：" + pageLabel(pos));
     }
 
     /** 相邻两集的地址先要回来（只握手，不起播），滑动出去时基本是即时的。 */
@@ -1785,12 +1971,14 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
     }
 
     private void preload(final int pos) {
-        if (pos < 0 || pos >= eps.length || session.hasUrl(pos) || session.isResolving(pos)
+        if (pos < 0 || pos >= pageCount() || session.hasUrl(pos) || session.isResolving(pos)
                 || session.hasFailed(pos)) return;
         session.beginResolve(pos);
+        final String videoId = pageVideoId(pos);
+        final int episode = pageEpisode(pos);
         new Thread(new Runnable() {
             @Override public void run() {
-                final String url = resolveViaJs(eps[pos]);
+                final String url = resolveViaJs(videoId, episode);
                 ui.post(new Runnable() {
                     @Override public void run() {
                         session.endResolve(pos);
@@ -1809,8 +1997,12 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
                             PageView pv = feedAdapter == null ? null : feedAdapter.pageAt(pos);
                             if (pv != null) {
                                 pv.spin.setVisibility(View.GONE);
-                                pv.error.setVisibility(View.VISIBLE);
-                                pv.error.setText("第 " + eps[pos] + " 集取不到播放地址，滑到别的集再回来试试");
+                                if (feedListMode) {
+                                    skipDeadFeedItem(pos);
+                                } else {
+                                    pv.error.setVisibility(View.VISIBLE);
+                                    pv.error.setText("第 " + pageEpisode(pos) + " 集取不到播放地址，滑到别的集再回来试试");
+                                }
                             }
                         }
                     }
@@ -1825,8 +2017,11 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
      * 链路：反射拿 MainActivity.host 的 webView（同一个进程，字段没混淆），
      * evaluateJavascript 调 window.__hgNativeEpisode(id, ep)，拿回一个 URL 字符串。
      * 主线程才能调 evaluateJavascript，所以在主线程发、用闩锁等结果。
+     *
+     * @param videoId 这一页的视频 id。SERIES 恒为 payload.id；FEED_LIST 取 feedList[pos].id。
+     *                缓存 key 是 {@code id:ep}（前端 __hgNativeEps 表同口径），跨 id 天然不串。
      */
-    private String resolveViaJs(int ep) {
+    private String resolveViaJs(String videoId, int ep) {
         // 页面那个口子是同步的：有缓存当场给，没有就回去发起解析、返回空串。
         // 所以这里轮询——当前集一般第一击就中（网页播放器刚播过它），
         // 预取的邻集要等页面解析完，AGE 那条 wasm 线路最慢十几秒。
@@ -1836,7 +2031,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         // 和 async 的（evaluateJavascript 收到的是 "{}"）。这里两种都认：
         // 同步的直接用，Promise 的挂一个 then 把结果写进 __hgNativeEps 表，
         // 下一轮从这里读。热更新还没下发到位的机器也能正常取地址。
-        final String idLit = JSONObject.quote(payload.optString("id", ""));
+        final String idLit = JSONObject.quote(videoId == null ? "" : videoId);
         final String script =
                 "(function(){"
                 + "var t = window.__hgNativeEps || (window.__hgNativeEps = {});"
@@ -1898,6 +2093,108 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         }
     }
 
+    /**
+     * 滑到末条附近且还有下一页时，向前端要更多（H-2）。
+     *
+     * <p>触发时机：{@link #activate} 与 EndReached 末条两条路都调。去重靠
+     * {@link #feedMorePending} + {@link #listToken} 校验。真正的拉页在前端：
+     * 原生先反射调 {@code window.__hgNativeFeedMore(listToken, fromIndex)} 通知前端，
+     * 前端拉完把结果写进 {@code window.__hgNativeFeedQueue[listToken]}（前端用
+     * {@code __hgNativeFeedAppend} 完成写入），原生这边轮询把队列读走。
+     *
+     * <p>不该动就绝不动作：{@code hasMore=false} / 已在请求 / 离末条还远，都直接返回。
+     */
+    private void maybeRequestMoreFeed(int pos) {
+        if (!feedListMode) return;
+        if (!hasMore || feedMorePending) return;
+        // 距离末条还剩 2 条以内才提前要，避免滑到底才现拉（会空转）。
+        if (pos < pageCount() - 2) return;
+        feedMorePending = true;
+        final String token = listToken;
+        final int fromIndex = pageCount();
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    // ① 叫前端去拉（幂等：前端自己有 loading 互斥）。
+                    askPageOnce("(function(){try{var f=window.__hgNativeFeedMore;"
+                            + "if(typeof f==='function')f(" + JSONObject.quote(token) + "," + fromIndex + ");"
+                            + "}catch(e){}return 'ok';})()");
+                    // ② 轮询读前端写进来的队列（最多 ~12s，和 resolveViaJs 一个量级）。
+                    for (int attempt = 0; attempt < 30; attempt++) {
+                        final String payloadJson = askPageOnce(
+                                "(function(){try{var q=window.__hgNativeFeedQueue||{};"
+                                + "var t=" + JSONObject.quote(token) + ";"
+                                + "if(q[t]){var v=q[t];delete q[t];return (typeof v==='string')?v:JSON.stringify(v);}"
+                                + "}catch(e){}return '';})()");
+                        if (payloadJson != null && payloadJson.length() > 0) {
+                            final String got = payloadJson;
+                            ui.post(new Runnable() {
+                                @Override public void run() { onFeedMoreResult(token, got); }
+                            });
+                            return;
+                        }
+                        try { Thread.sleep(400); } catch (InterruptedException e) { return; }
+                    }
+                } finally {
+                    ui.post(new Runnable() {
+                        @Override public void run() {
+                            if (token.equals(listToken)) feedMorePending = false;
+                        }
+                    });
+                }
+            }
+        }).start();
+    }
+
+    /**
+     * 续页回包。{@code listToken} 仍等于当前才采纳（防串台：换列表/换形态的旧回包丢弃）。
+     *
+     * @param payloadJson 前端给的结果 {@code {"items":[{id,title,cover,source}...],"hasMore":bool}}
+     */
+    private void onFeedMoreResult(String token, String payloadJson) {
+        if (!feedListMode) return;
+        if (!token.equals(listToken)) {
+            android.util.Log.d("AIIvideo", "[player] feed-more 回包 listToken 已变，丢弃");
+            return;
+        }
+        int added = appendFeedItems(feedList, payloadJson);
+        if (added > 0) {
+            feedAdapter.notifyItemRangeInserted(feedList.size() - added, added);
+            android.util.Log.d("AIIvideo", "[player] feed-more 追加 " + added + " 条");
+        }
+        // hasMore 由回包决定：没有更多就停，避免无限请求空页。
+        try {
+            org.json.JSONObject obj = new org.json.JSONObject(payloadJson);
+            hasMore = obj.optBoolean("hasMore", false);
+        } catch (Throwable ignored) { hasMore = false; }
+    }
+
+    /**
+     * 解析续页 JSON 并追加到 feedList，返回追加条数。
+     *
+     * <p>纯逻辑（不碰 UI/网络），单测可直接喂 JSON。字段口径同 payload.feedList。
+     */
+    static int appendFeedItems(final java.util.List<FeedItem> target, String payloadJson) {
+        if (target == null || payloadJson == null || payloadJson.length() == 0) return 0;
+        try {
+            org.json.JSONObject obj = new org.json.JSONObject(payloadJson);
+            org.json.JSONArray items = obj.optJSONArray("items");
+            if (items == null) return 0;
+            int before = target.size();
+            for (int i = 0; i < items.length(); i++) {
+                org.json.JSONObject one = items.optJSONObject(i);
+                if (one == null) continue;
+                String id = one.optString("id", "").trim();
+                if (id.length() == 0) continue;
+                target.add(new FeedItem(id, one.optString("title", ""),
+                        one.optString("cover", ""), one.optString("source", "")));
+            }
+            return target.size() - before;
+        } catch (Throwable e) {
+            return 0;
+        }
+    }
+
     private long resumeOf(int pos) {
         if (pos == payload.optInt("index", 0)) return startedAt;
         return 0;
@@ -1914,9 +2211,16 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
     }
 
     private void updateEpisodeUi() {
-        controls.setTitle(payload.optString("title", "播放中") + " · 第 " + eps[curPos] + " 集");
-        controls.setMeta((hwDecode ? "硬解优先" : "软解") + " · " + abi()
-                + " · " + (curPos + 1) + "/" + eps.length);
+        if (feedListMode) {
+            // 刷视频：一页一条独立视频，不写「第N集」，也不写剧内集数比。
+            controls.setTitle(pageTitle(curPos).length() > 0 ? pageTitle(curPos) : "播放中");
+            controls.setMeta((hwDecode ? "硬解优先" : "软解") + " · " + abi()
+                    + " · " + (curPos + 1) + "/" + pageCount() + " 条");
+        } else {
+            controls.setTitle(payload.optString("title", "播放中") + " · 第 " + pageEpisode(curPos) + " 集");
+            controls.setMeta((hwDecode ? "硬解优先" : "软解") + " · " + abi()
+                    + " · " + (curPos + 1) + "/" + pageCount());
+        }
     }
 
     /**
@@ -1945,7 +2249,19 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
      * <p>包内可见、纯函数：两侧落盘都调它，单测直接钉住取值。
      */
     static String progressMode(boolean feedMode) {
-        return feedMode ? "feed" : "single";
+        return progressMode(feedMode, false);
+    }
+
+    /**
+     * 进度落盘「来源形态」三态：{@code single} / {@code feed}（同剧多集）/ {@code feedList}（刷视频）。
+     *
+     * <p>{@link #persist(boolean)}（单集）与 {@link #persistFeedProgress()}（pager）共用
+     * prefs key {@code "last"}，前端靠它区分来源：单集别拿 feed 的 episode 续播、
+     * 刷视频（feedList）只续位置不记历史。口径与 play_start/play_end 埋点一致。
+     */
+    static String progressMode(boolean feedMode, boolean feedListMode) {
+        if (!feedMode) return "single";
+        return feedListMode ? "feedList" : "feed";
     }
 
     /** 把当前这一集的现场写进 prefs。切集和退出都会调。 */
@@ -1957,11 +2273,11 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             JSONObject record = new JSONObject();
             String cached = session.urlOf(curPos);
             record.put("url", cached != null ? cached : payload.optString("url", ""));
-            record.put("id", payload.optString("id", ""));
-            record.put("episode", eps[curPos]);
-            record.put("title", payload.optString("title", ""));
-            record.put("cover", payload.optString("cover", ""));
-            record.put("source", payload.optString("source", ""));
+            record.put("id", pageVideoId(curPos));
+            record.put("episode", pageEpisode(curPos));
+            record.put("title", pageTitle(curPos));
+            record.put("cover", pageCover(curPos));
+            record.put("source", pageSource(curPos));
             record.put("position", position);
             record.put("duration", duration);
             // finished 必须算上 sawEnd：feed 末集 EndReached 里「落盘后立刻把
@@ -1969,9 +2285,9 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             // 再落一次盘就把「已看完」覆盖成 false —— 观看历史永远记成没看完。
             // 口径对齐 onDestroy 的 play_end 埋点（ended||sawEnd）与 persist()。
             record.put("finished", feedFinished(ended, sawEnd));
-            // 来源形态：本方法只在 feed 模式被调用，恒为 feed。与 persist() 共用
-            // prefs key "last"，前端靠 mode 区分来源（别拿 feed 的 episode 去续单集）。
-            record.put("mode", progressMode(feedMode));
+            // 来源形态：本方法在 pager 形态（SERIES/FEED_LIST）被调用；feedList 刷走
+            // 不应记历史，前端靠这个 mode 分派（feedList 分支只续位置、不 report）。
+            record.put("mode", progressMode(feedMode, feedListMode));
             record.put("error", errorText);
             record.put("at", System.currentTimeMillis());
             getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -2071,10 +2387,12 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             sawEnd = true;
             persistFeedProgress();
             ended = false;
-            // 抖音流的规矩：播完自动滑到下一集
-            if (curPos + 1 < eps.length) {
+            // 抖音流的规矩：播完自动滑到下一条（SERIES 下一集 / FEED_LIST 下一条视频）。
+            if (curPos + 1 < pageCount()) {
                 pager.smoothScrollToPosition(curPos + 1);
             } else {
+                // 末条：FEED_LIST 若还有下一页就先要更多；否则停在末条。
+                if (feedListMode) maybeRequestMoreFeed(curPos);
                 controls.setPlayIcon(VlcControlsView.IconButton.PLAY);
                 setControlsVisible(true);
             }
@@ -2096,6 +2414,8 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
      * 按这个列表换线重试」）。别的集是滑动时现取的，没有备选，返回空表。
      */
     private String[] altsOf(int pos) {
+        // 刷视频：每条是独立视频，没有剧内备选线路；放不了就滑走换下一条（靠 skip）。
+        if (feedListMode) return NO_ALTS;
         if (pos != payload.optInt("index", -1)) return NO_ALTS;
         org.json.JSONArray raw = payload.optJSONArray("alts");
         if (raw == null || raw.length() == 0) return NO_ALTS;
@@ -2123,15 +2443,22 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         String[] alts = altsOf(curPos);
         int next = session.takeNextAlt(curPos, alts.length);
         if (next < 0) {
+            // 刷视频：无剧内备选，解不了就跳过这一条滑走（与取不到地址同策略）。
+            if (feedListMode) {
+                skipDeadFeedItem(curPos);
+                reportPlayFailure("feedlist-error", "EncounteredError",
+                        "视频 " + pageVideoId(curPos) + playbackFailureText());
+                return;
+            }
             PageView pv = feedAdapter == null ? null : feedAdapter.pageAt(curPos);
             if (pv != null) {
                 pv.spin.setVisibility(View.GONE);
                 pv.error.setVisibility(View.VISIBLE);
-                pv.error.setText("第 " + eps[curPos] + " 集" + playbackFailureText());
+                pv.error.setText("第 " + pageEpisode(curPos) + " 集" + playbackFailureText());
             }
             // feed 模式不走 showError（每一页有自己的错误文案），所以单独报一条。
             reportPlayFailure("alts-exhausted", "EncounteredError",
-                    "第 " + eps[curPos] + " 集" + playbackFailureText());
+                    "第 " + pageEpisode(curPos) + " 集" + playbackFailureText());
             return;
         }
         // 幂等判断认的是「这个 player 上挂着哪条地址」，所以换代选之前必须先把
@@ -2139,7 +2466,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
         MediaPlayer mp = playerFor(curPos);
         if (mp != null) session.clearPlayingUrl(mp);
         session.rememberUrl(curPos, alts[next]);
-        android.util.Log.i("HG.Vlc", "换线：第 " + eps[curPos] + " 集 → 备选 " + (next + 1) + "/" + alts.length);
+        android.util.Log.i("HG.Vlc", "换线：" + pageLabel(curPos) + " → 备选 " + (next + 1) + "/" + alts.length);
         playPage(curPos, alts[next]);
     }
 
@@ -2151,7 +2478,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             controls.setMeta(track.width + "×" + track.height
                     + (codec.length() > 0 ? " " + codec : "")
                     + " · " + (hwDecode ? "硬解优先" : "软解")
-                    + " · 第 " + eps[curPos] + " 集");
+                    + (feedListMode ? "" : " · 第 " + pageEpisode(curPos) + " 集"));
         } catch (Throwable ignored) {}
     }
 
@@ -2274,7 +2601,7 @@ public class VlcPlayerActivity extends Activity implements MediaPlayer.EventList
             holder.page.surfaceReady = false;
         }
 
-        @Override public int getItemCount() { return eps.length; }
+        @Override public int getItemCount() { return pageCount(); }
 
         PageView pageAt(int pos) {
             PageView pv = live.get(pos);

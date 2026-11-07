@@ -49,4 +49,16 @@ public class VlcProgressModeTest {
         assertEquals("feed", feed);
         org.junit.Assert.assertNotEquals("单集与 feed 的 mode 不能相同，否则前端无法区分", single, feed);
     }
+
+    // ── 三态（刷视频 feedList 加入后）───────────────────────────────
+
+    /** 刷视频（feedList）落 "feedList"，与 feed / single 三者互不相同。 */
+    @Test public void 形态_刷视频落feedList() {
+        assertEquals("feedList", VlcPlayerActivity.progressMode(true, true));
+        assertEquals("feed", VlcPlayerActivity.progressMode(true, false));       // SERIES
+        assertEquals("single", VlcPlayerActivity.progressMode(false, false));    // 单集
+        // feedList 与 feed 必须能区分：否则前端「刷走不记历史」会把整部剧连播也吞了。
+        org.junit.Assert.assertNotEquals(VlcPlayerActivity.progressMode(true, true),
+                VlcPlayerActivity.progressMode(true, false));
+    }
 }
