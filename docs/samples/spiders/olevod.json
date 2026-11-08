@@ -1,0 +1,215 @@
+{
+  "_note": "欧乐影院（www.olevod.com）。前端是 Vue SPA + Go WASM，数据全在 api.olelive.com（纯 JSON GET，但每个请求必须带 _vv 签名，算法见 olevod.js 头注释）。封面图床 static.olelive.com（明文直出）。播放是普通 HLS，抽 432 部/7360 条 url 只出现 cloud.yuntongclouds.com 与 dubo.oulehdtv.tv 两个 CDN —— http.hosts 必须精确列全。午夜影院(5)/VIP蓝光(6) 是会员专区，匿名能列不能播，play 里会降级成 reason:'vip'。",
+  "origin": "https://www.olevod.com",
+  "headers": {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Mobile Safari/537.36",
+    "Referer": "https://www.olevod.com/"
+  },
+  "cover": {
+    "mode": "plain",
+    "allowedHosts": [
+      "static.olelive.com"
+    ]
+  },
+  "http": {
+    "_why": "播放层出口白名单（精确匹配 host.equals）。cloud.yuntongclouds.com 是主 CDN，dubo.oulehdtv.tv 是少量片源。m3u8 的分片和变体清单都是同域相对路径，所以只需这两条。真机若报『主机不在播放层白名单：xxx』，把该 host 补进来。",
+    "hosts": [
+      "cloud.yuntongclouds.com",
+      "dubo.oulehdtv.tv"
+    ]
+  },
+  "net": {
+    "_why": "【2026-11-08 更正】欧乐是面向海外华人的站，api.olelive.com / 播放 CDN / 封面图床对大陆出口一律 HTTP 403（真机实测：直连 403，走代理 200）。最初写 declared+proxy:[] 强制直连是错的——那会让整站 403、首页全空。现改为只把这些域走代理，其余直连：跟「源声明了 net.proxy，表里的域走代理」的语义一致。",
+    "declared": true,
+    "proxy": [
+      "api.olelive.com",
+      "static.olelive.com",
+      "cloud.yuntongclouds.com",
+      "dubo.oulehdtv.tv"
+    ]
+  },
+  "web": {
+    "spider": "https://149.104.21.177.sslip.io/spiders/olevod.js",
+    "firstPageSize": 36,
+    "pageSize": 36,
+    "ui": {
+      "tabs": [
+        {
+          "key": "1",
+          "label": "电影",
+          "icon": "film"
+        },
+        {
+          "key": "2",
+          "label": "连续剧",
+          "icon": "grid"
+        },
+        {
+          "key": "3",
+          "label": "综艺",
+          "icon": "star"
+        },
+        {
+          "key": "4",
+          "label": "动漫",
+          "icon": "sparkle"
+        },
+        {
+          "key": "14",
+          "label": "短剧",
+          "icon": "film"
+        },
+        {
+          "key": "5",
+          "label": "午夜影院",
+          "icon": "grid"
+        }
+      ],
+      "categoryIds": {
+        "1": [
+          "1",
+          "101",
+          "102",
+          "103",
+          "104",
+          "105",
+          "106",
+          "107",
+          "108",
+          "109",
+          "110",
+          "111",
+          "112",
+          "113"
+        ],
+        "2": [
+          "2",
+          "202",
+          "201",
+          "203",
+          "204",
+          "1207"
+        ],
+        "3": [
+          "3",
+          "305",
+          "302",
+          "304",
+          "301",
+          "303"
+        ],
+        "4": [
+          "4",
+          "401",
+          "402",
+          "403"
+        ],
+        "14": [
+          "14",
+          "1209",
+          "1210",
+          "1211",
+          "1212",
+          "1213",
+          "1214",
+          "1215",
+          "1216",
+          "1217",
+          "1218",
+          "1219",
+          "1220"
+        ],
+        "5": [
+          "5",
+          "506",
+          "505",
+          "502",
+          "501",
+          "503",
+          "504"
+        ]
+      },
+      "categoryLabels": {
+        "1": [
+          "电影",
+          "动作片",
+          "喜剧片",
+          "爱情片",
+          "科幻片",
+          "恐怖片",
+          "剧情片",
+          "战争片",
+          "动画片",
+          "悬疑片",
+          "惊悚片",
+          "纪录片",
+          "奇幻片",
+          "犯罪片"
+        ],
+        "2": [
+          "连续剧",
+          "国产剧",
+          "欧美剧",
+          "港台剧",
+          "日韩剧",
+          "短剧"
+        ],
+        "3": [
+          "综艺",
+          "真人秀",
+          "音乐",
+          "搞笑",
+          "家庭",
+          "曲艺"
+        ],
+        "4": [
+          "动漫",
+          "日本",
+          "国产",
+          "欧美"
+        ],
+        "14": [
+          "短剧",
+          "言情",
+          "都市",
+          "甜宠",
+          "逆袭",
+          "玄幻",
+          "仙侠",
+          "穿越",
+          "重生",
+          "王妃",
+          "总裁",
+          "离婚",
+          "其他"
+        ],
+        "5": [
+          "午夜影院",
+          "AI真人",
+          "AV女优",
+          "日韩",
+          "欧美",
+          "动漫",
+          "国产"
+        ]
+      },
+      "categoryTitles": {
+        "1": "电影",
+        "2": "连续剧",
+        "3": "综艺",
+        "4": "动漫",
+        "14": "短剧",
+        "5": "午夜影院"
+      }
+    },
+    "categories": {
+      "1": "电影",
+      "2": "连续剧",
+      "3": "综艺",
+      "4": "动漫",
+      "14": "短剧",
+      "5": "午夜影院",
+      "6": "VIP蓝光影院"
+    }
+  }
+}

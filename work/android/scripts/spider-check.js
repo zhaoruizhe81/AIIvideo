@@ -969,6 +969,68 @@ const PROFILES = {
     },
   },
 
+  // ── 欧乐影院（olevod，www.olevod.com）──────────────────────────────────
+  // 站点是 Vue SPA + Go WASM，数据在 api.olelive.com；每个 GET 都要 _vv 签名
+  // （算法在 olevod.js 头注释，纯 JS md5 复刻前端 fe()）。夹具是真实响应。
+  olevod: {
+    dir: 'olevod',
+    fixtures: {
+      'banners.json': /\/v1\/pub\/index\/banners/,
+      'newest.json': /\/v1\/pub\/vod\/newest\//,
+      'list-movie.json': /\/v1\/pub\/vod\/list\//,
+      'search.json': /\/v1\/pub\/index\/search\//,
+      'detail.json': /\/v1\/pub\/vod\/detail\//,
+    },
+    checks: {
+      home: [
+        ['卡片 ≥ 20', r => (r.items || []).length >= 20],
+        ['id 全是数字', r => (r.items || []).every(one => /^\d+$/.test(String(one.id)))],
+        ['封面都是 static.olelive.com 的 https 绝对地址',
+          r => (r.items || []).every(one => /^https:\/\/static\.olelive\.com\//.test(String(one.cover)))],
+        ['没有重复 id',
+          r => new Set((r.items || []).map(one => String(one.id))).size === (r.items || []).length],
+        ['hasMore 是布尔 false（首页不分页）', r => r.hasMore === false],
+      ],
+      category: [
+        ['一页 36 张（pageSize=36，站点只认 12/36/48）', r => (r.items || []).length === 36],
+        ['首条 id 是 83946', r => String((r.items || [])[0] && r.items[0].id) === '83946'],
+        ['hasMore 是布尔 true（total=4192）', r => r.hasMore === true],
+        ['封面是 https 绝对地址', r => (r.items || []).every(one => /^https:\/\//.test(String(one.cover)))],
+      ],
+      search: [
+        ['搜到 6 条', r => (r.items || []).length === 6],
+        ['首条是斗罗大陆2：绝世唐门',
+          r => String((r.items || [])[0] && r.items[0].title).indexOf('斗罗大陆2') === 0],
+        ['id 是纯数字', r => /^\d+$/.test(String(((r.items || [])[0] || {}).id))],
+      ],
+      detail: [
+        ['标题是尚公主', r => String(r.title || '') === '尚公主'],
+        ['31 集', r => (r.episodes || []).length === 31],
+        ['第一集 ref 是 1', r => String((((r.episodes || [])[0]) || {}).ref) === '1'],
+        ['第一集标题第01集', r => String((((r.episodes || [])[0]) || {}).title) === '第01集'],
+        ['封面在 static.olelive.com',
+          r => /^https:\/\/static\.olelive\.com\//.test(String(r.cover || ''))],
+        ['默认为一条线路', r => (r.lines || []).length === 1],
+      ],
+      play: [
+        ['地址是 m3u8', r => /\.m3u8/.test(String(r.url || ''))],
+        ['落在 yuntongclouds 或 oulehdtv', r => /(yuntongclouds|oulehdtv)/.test(String(r.url || ''))],
+        ['备选 1 条', r => (r.alts || []).length === 1],
+        ['集号 3', r => Number(r.episodeNumber) === 3],
+        ['请求的是详情 /1（要解析直链的那个开关）',
+          (r, info) => (info.requested || []).some(req =>
+            /\/v1\/pub\/vod\/detail\/86281\/1/.test(String((req && req.url) || req)))],
+      ],
+    },
+    args: {
+      home: {},
+      category: { slug: '1', page: 1 },
+      search: { keyword: '斗罗', page: 1 },
+      detail: { ref: '86281' },
+      play: { ref: '86281:3', ep: 3 },
+    },
+  },
+
   // ── yarn 6/7/8：agedm / cms / openlist ─────────────────────────────────
   //
   // 仓库里一份夹具都没有（这三个源的 JUnit —— AgedmAdapterTest 不存在、
