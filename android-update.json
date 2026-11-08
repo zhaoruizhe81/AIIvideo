@@ -1,15 +1,15 @@
 {
-  "versionName": "2.0.30",
-  "tag": "v2.0.30",
-  "versionCode": 20030,
-  "apk": "AIIvideo-v2.0.30-release.apk",
+  "versionName": "2.1.0",
+  "tag": "v2.1.0",
+  "versionCode": 20100,
+  "apk": "AIIvideo-v2.1.0-release.apk",
   "urls": [
-    "https://gh-proxy.com/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.30/AIIvideo-v2.0.30-release.apk",
-    "https://ghfile.geekertao.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.30/AIIvideo-v2.0.30-release.apk",
-    "https://gh.dpik.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.30/AIIvideo-v2.0.30-release.apk",
-    "https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.0.30/AIIvideo-v2.0.30-release.apk"
+    "https://gh-proxy.com/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.1.0/AIIvideo-v2.1.0-release.apk",
+    "https://ghfile.geekertao.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.1.0/AIIvideo-v2.1.0-release.apk",
+    "https://gh.dpik.top/https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.1.0/AIIvideo-v2.1.0-release.apk",
+    "https://github.com/zhaoruizhe81/AIIvideo/releases/download/v2.1.0/AIIvideo-v2.1.0-release.apk"
   ],
-  "sha256": "ccade41f4c8fef29c96751bd5662ac4cce4b11e441b2d6ad3a94c6e1bdaf3d62",
-  "size": 41024382,
-  "notes": "2.0.30：九模块并行深审后的一轮 bug 修复（4 高危 + 6 中危）。挑能感知的说：\n\n一、播放与观看历史\n- 修复「看完最后一部/最后一集，观看历史仍显示没看完」：末集结束时会重置播放态，退出时又把完成标记覆盖掉\n- 修复整部剧连播与单集播放的进度串台：单集进度不再被当成整部剧的某一集去定位/续播\n\n二、埋点与云同步\n- 修复发送失败的单条埋点会被无限重发（进隔离区后仍被写回队列，越积越多直至丢掉新事件）\n- 修复云同步把本地已裁剪掉的历史又合并回来（补上删除墓碑）\n\n三、更新体验\n- 修复「下载更新途中打开设置页，整页点什么都没反应」：查询/回放不再等下载那把锁\n\n四、代理与订阅\n- 修复同一台服务器、仅加密方式或带宽不同的节点被当成重复、被去重吞掉\n\n五、界面\n- 修复详情选集号来自异常源时可能注入/显示 undefined\n- 修复封面加载失败冻结时长分档判据（网络类 30 秒可重试，真坏图 5 分钟）\n- 市场装源加互斥，中途出错不再永久卡在「正在切换源」\n\n---\nsha256: `ccade41f4c8fef29c96751bd5662ac4cce4b11e441b2d6ad3a94c6e1bdaf3d62`\n大小: 41,024,382 字节（39.1 MB）\n单测 393 条全过（较上版 +29），42 条 JS 钩子断言全过，APK 断言（27 个 JS 全部 ES2017 可解析、dex 1 / so 4 / assets 77）通过。"
+  "sha256": "1da8c4770e77750c98198b04953a88e793f59c05464f8bb8ff030420af4274d9",
+  "size": 41048154,
+  "notes": "2.1.0：刷视频模式 + 欧乐影院源 + 冷启动封面修复。\n\n一、刷视频模式（抖音式竖滑）\n- 原生 FEED_LIST 跨视频竖滑、沉浸壳、设置开关、详情往返\n- 迭代2：锁屏态交互、右侧圆形封面入口进详情、返回续播\n\n二、新增内容源：欧乐影院（olevod）\n- 电影/连续剧/综艺/动漫/短剧/午夜；接口 _vv 签名、走代理、缩略图封面\n\n三、修复\n- 冷启动封面全灰：把「代理核心启动中」误判成「无代理」→ 直连撞 geo 403 → 封面失败缓存冻 5 分钟。现在等核心就绪再走代理。\n\n---\nsha256: `1da8c4770e77750c98198b04953a88e793f59c05464f8bb8ff030420af4274d9`\n大小: 41,048,154 字节（39.1 MB）"
 }
