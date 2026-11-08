@@ -142,6 +142,21 @@ public final class AiiHttp {
     }
 
     /**
+     * 当前是否「内置核心」代理模式。
+     *
+     * <p>用来区分<b>「没有代理」</b>和<b>「核心还没起来」</b>：内置核心模式下
+     * {@code effectiveProxy()} 在启动头一两秒是空串，那是「还没好」，不表示用户
+     * 没配代理。{@link NetRoute#proxyUnavailable} 据此不要把必须代理的域降级成
+     * 直连 —— 否则冷启动那一瞬间封面/接口会拿直连去撞 geo 403（欧乐影院 2026-11-08）。
+     */
+    static boolean builtinMode() {
+        if (processProxyMode != null && processProxyMode.length() > 0) {
+            return ProxyConsole.MODE_BUILTIN.equals(processProxyMode);
+        }
+        return ProxyConsole.MODE_BUILTIN.equals(proxyModeOrEmpty());
+    }
+
+    /**
      * 进程级代理覆盖。**只有 :spider 服务进程会用到**（SpiderService.call 每次请求
      * 前设置）：内置核心的本地 SOCKS 地址是主进程内存里的值，SharedPreferences
      * 里没有它，独立进程自己读永远读出空 —— 不传这个覆盖，「源声明要走代理」

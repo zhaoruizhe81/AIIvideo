@@ -209,6 +209,11 @@ final class NetRoute {
         if (!s.declared) return false;                  // 没声明 → 老规则自己会处理
         String h = host.toLowerCase(Locale.ROOT).trim();
         if (!matches(s.proxyHosts, h)) return false;    // 不在代理表，本来就该直连
+        // 内置核心模式下「代理串为空」只是「核心还没起来」，不是「没有代理」：
+        // 返回 false，让路由走代理分支（routeForProxyHost 会等核心就绪），
+        // 避免冷启动把必须代理的域判成直连、拿直连去撞 geo 403。
+        // 2026-11-08 欧乐影院：封面请求比核心早 ~0.2s 发出，就被这里降级成直连→403。
+        if (AiiHttp.builtinMode()) return false;
         return AiiHttp.effectiveProxy().length() == 0;
     }
 
